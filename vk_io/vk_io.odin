@@ -36,7 +36,6 @@ io_start :: proc(io: ^IO_State) -> bool {
 	io.thread = thread.create_and_start_with_data(
 		rawptr(io),
 		io_thread_main,
-		name = "nbio-io",
 	)
 
 	if io.thread == nil {

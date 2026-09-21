@@ -14,6 +14,7 @@ Loaded_Shader :: struct {
 load_spirv_file :: proc(
 	ctx: ^render.Context,
 	file_name: string,
+	has_task_shader: bool = false,
 ) -> Loaded_Shader {
 	//
 	// Expected filename:
@@ -60,9 +61,17 @@ load_spirv_file :: proc(
 	case "comp":
 		stage = {.COMPUTE}
 
+	case "mesh":
+		stage = {.MESH_EXT}
+		next_stage = {.FRAGMENT}
+
+	case "task":
+		stage = {.TASK_EXT}
+		next_stage = {.MESH_EXT}
+
 	case:
 		fmt.panicf(
-			"invalid shader stage '%s' in '%s': expected vert, frag, or comp",
+			"invalid shader stage '%s' in '%s': expected vert, frag, comp, mesh, or task",
 			stage_name,
 			file_name,
 		)
@@ -105,8 +114,19 @@ load_spirv_file :: proc(
 		)
 	}
 
+	// A mesh shader used without a task shader must say so explicitly;
+	// omitting this left the driver in an undefined state that reliably
+	// hung the GPU on the first CmdDrawMeshTasksEXT, with no validation
+	// error to point at it. Conversely the flag must NOT be set when a
+	// task shader does target this mesh shader.
+	shader_flags: vk.ShaderCreateFlagsEXT
+	if stage == {.MESH_EXT} && !has_task_shader {
+		shader_flags = {.NO_TASK_SHADER}
+	}
+
 	shader_info := vk.ShaderCreateInfoEXT {
 		sType    = .SHADER_CREATE_INFO_EXT,
+		flags    = shader_flags,
 		stage    = stage,
 		nextStage = next_stage,
 

@@ -5,17 +5,23 @@ import "vendor:sdl2"
 import "render"
 import vk_io "vk_io"
 
-write_conway_row :: proc(
+write_grid_snapshot :: proc(
 	io: ^vk_io.IO_State,
-	row: []u32,
+	cells: []u32,
+	width: u32,
 ) {
-	buffer := make([]u8, len(row) + 1, context.temp_allocator)
+	height := u32(len(cells)) / width
+	buffer := make([]u8, len(cells) + int(height), context.temp_allocator)
 
-	for cell, i in row {
-		buffer[i] = '#' if cell != 0 else '.'
+	out := 0
+	for y in 0 ..< height {
+		for x in 0 ..< width {
+			buffer[out] = '#' if cells[y * width + x] != 0 else '.'
+			out += 1
+		}
+		buffer[out] = '\n'
+		out += 1
 	}
-
-	buffer[len(row)] = '\n'
 
 	vk_io.write_async(io, buffer)
 }
@@ -46,13 +52,32 @@ main :: proc() {
 			if event.type == .KEYDOWN && event.key.keysym.sym == .ESCAPE {
 				running = false
 			}
+
+			if event.type == .WINDOWEVENT &&
+			   (event.window.event == .RESIZED || event.window.event == .SIZE_CHANGED) {
+				ctx.framebuffer_resized = true
+			}
+		}
+
+		if ctx.framebuffer_resized {
+			recreate_swapchain(&ctx)
 		}
 
 		slot := frame % render.MAX_FRAMES_IN_FLIGHT
-		row, submitted := render.run_compute(&ctx, slot)
-		if submitted {
-			write_conway_row(&ctx.io, row[:len(row)])
+		switch render.run_frame(&ctx, slot) {
+		case .Submitted:
+			when ODIN_DEBUG {
+				grid := render.simulation_debug_readback(&ctx, context.temp_allocator)
+				write_grid_snapshot(&ctx.io, grid, ctx.simulation.width)
+			}
+
 			frame += 1
+
+		case .Skipped:
+		// Nothing was ready this tick; try again next iteration.
+
+		case .Swapchain_Out_Of_Date:
+			recreate_swapchain(&ctx)
 		}
 	}
 }

@@ -412,6 +412,35 @@ bindless_allocate_sampler :: proc(
 
 	return handle, true
 }
+// Repoints an already-allocated TEXTURE_2D slot at a different image view,
+// e.g. after recreating a swapchain-sized render target. Unlike
+// bindless_allocate_*, this does not touch the slot allocator: the index
+// keeps its owner, only the descriptor's contents change.
+bindless_update_texture_2d :: proc(
+	ctx: ^Context,
+	index: u32,
+	image_view: vk.ImageView,
+	image_layout: vk.ImageLayout = .SHADER_READ_ONLY_OPTIMAL,
+) {
+	image_info := vk.DescriptorImageInfo {
+		sampler     = {},
+		imageView   = image_view,
+		imageLayout = image_layout,
+	}
+
+	write := vk.WriteDescriptorSet {
+		sType           = .WRITE_DESCRIPTOR_SET,
+		dstSet          = ctx.bindless.set,
+		dstBinding      = bindless_binding(.TEXTURE_2D),
+		dstArrayElement = index,
+		descriptorCount = 1,
+		descriptorType  = .SAMPLED_IMAGE,
+		pImageInfo      = &image_info,
+	}
+
+	vk.UpdateDescriptorSets(ctx.device, 1, &write, 0, nil)
+}
+
 bindless_allocate_texture_2d :: proc(
 	ctx: ^Context,
 	image_view: vk.ImageView,

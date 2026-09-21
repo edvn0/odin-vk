@@ -4,6 +4,7 @@ import "base:runtime"
 import "core:debug/trace"
 import "core:fmt"
 import "core:io"
+import "core:math/rand"
 import "core:os"
 import "core:strings"
 import "core:text/table"
@@ -13,6 +14,35 @@ import "render"
 import ds "data_structures"
 import "vendor:sdl2"
 import vk "vendor:vulkan"
+
+print_backtrace :: proc() {
+	trace_ctx: trace.Context
+	if !trace.init(&trace_ctx) {
+		fmt.eprintln("failed to init call trace")
+		return
+	}
+	defer trace.destroy(&trace_ctx)
+
+	buf: [32]trace.Frame
+	frames := trace.frames(&trace_ctx, 1, buf[:])
+
+	for f in frames {
+		fl := trace.resolve(&trace_ctx, f, context.allocator)
+		defer trace.delete_frame_location(fl)
+
+		if fl.file_path == "" {
+			continue
+		}
+
+		fmt.eprintfln(
+			"%s(%d:%d) - %s",
+			fl.file_path,
+			fl.line,
+			fl.column,
+			fl.procedure,
+		)
+	}
+}
 
 debug_callback :: proc "system" (
 	message_severity: vk.DebugUtilsMessageSeverityFlagsEXT,
@@ -30,15 +60,7 @@ debug_callback :: proc "system" (
 		fmt.eprintln("")
 		fmt.eprintln("Call trace:")
 
-		bt := trace.capture()
-
-		locations, err := trace.resolve(bt)
-		if err == nil {
-			trace.print(locations)
-			trace.locations_destroy(locations)
-		} else {
-			fmt.eprintfln("failed to resolve call trace: %v", err)
-		}
+		print_backtrace()
 
 		fmt.eprintln("========================================")
 	}
@@ -54,7 +76,7 @@ init_window :: proc(ctx: ^render.Context) {
 		sdl2.WINDOWPOS_CENTERED,
 		800,
 		600,
-		sdl2.WINDOW_VULKAN | sdl2.WINDOW_SHOWN,
+		sdl2.WINDOW_VULKAN | sdl2.WINDOW_SHOWN | sdl2.WINDOW_RESIZABLE,
 	)
 }
 
@@ -146,17 +168,29 @@ init_vulkan :: proc(ctx: ^render.Context) {
 	create_swapchain(ctx)
 	create_command_pool(ctx)
 	render.init_resource_pools(ctx)
-	for i in 0 ..< render.MAX_FRAMES_IN_FLIGHT {
-		handle := create_buffer(ctx, config.BUFFER_SIZE, {.STORAGE_BUFFER, .SHADER_DEVICE_ADDRESS})
-		ctx.frames[i].buffer = handle
-	}
-	seed_initial_generation(ctx)
+	init_simulation(ctx)
+	init_render_targets(ctx)
+	init_mesh(ctx, "./assets/suzanne.obj")
 	create_sync_objects(ctx)
 
 	ctx.shaders = make(map[render.Shader_Key]render.Shader_Handle)
 
 	files := find_all_spirv_files_in_directory("./shaders")
 	defer ds.destroy(&files)
+
+	// A mesh shader must declare NO_TASK_SHADER when it has no accompanying
+	// task shader (see load_spirv_file); find out which mesh shader names
+	// do have one by name (e.g. "suzanne.task.spv" pairs with
+	// "suzanne.mesh.spv") before loading any of them.
+	names_with_task_shader := make(map[string]bool, allocator = context.temp_allocator)
+	for file_name in ds.slice(&files) {
+		stem, extension := os.split_filename(os.base(file_name))
+		if extension != "spv" do continue
+		name, stage_name := os.split_filename(stem)
+		if stage_name == "task" {
+			names_with_task_shader[name] = true
+		}
+	}
 
 	log_buffer := strings.builder_make()
 	defer strings.builder_destroy(&log_buffer)
@@ -169,7 +203,11 @@ init_vulkan :: proc(ctx: ^render.Context) {
 	table.header(&shader_table, "Name", "Stage Flags")
 
 	for file_name in ds.slice(&files) {
-		loaded := load_spirv_file(ctx, file_name)
+		stem, _ := os.split_filename(os.base(file_name))
+		name, _ := os.split_filename(stem)
+		has_task_shader := names_with_task_shader[name]
+
+		loaded := load_spirv_file(ctx, file_name, has_task_shader)
 
 		key := render.Shader_Key {
 			name  = loaded.name,
@@ -202,6 +240,20 @@ REQUIRED_DEVICE_EXTENSIONS :: []cstring {
 	"VK_EXT_shader_object",
 	"VK_KHR_present_id",
 	"VK_KHR_present_wait",
+	// VK_EXT_shader_object replaces VkPipeline, so all fixed-function
+	// graphics state that a pipeline would otherwise bake in must be set
+	// dynamically. Vulkan 1.3 core covers most of it (cull mode, front
+	// face, topology, depth/stencil test enables, ...); these two
+	// extensions cover what 1.3 core does not: vertex input state and
+	// rasterization/blend state.
+	"VK_EXT_extended_dynamic_state3",
+	"VK_EXT_vertex_input_dynamic_state",
+	// Suzanne is drawn by a mesh shader (shaders/suzanne.mesh.slang)
+	// reading a flat vertex buffer by device address, rather than a
+	// classic vertex-input-assembly pipeline.
+	"VK_EXT_mesh_shader",
+	// Needed to select VK_PRESENT_MODE_FIFO_LATEST_READY_KHR below.
+	"VK_KHR_present_mode_fifo_latest_ready",
 }
 
 device_supports_extensions :: proc(device: vk.PhysicalDevice, required: []cstring) -> bool {
@@ -247,6 +299,15 @@ pick_physical_device :: proc(ctx: ^render.Context) {
 
 			ctx.physical_device = device
 			ctx.compute_family = u32(i)
+
+			device_info:= vk.PhysicalDeviceProperties{}
+			vk.GetPhysicalDeviceProperties(device, &device_info)
+
+			name:= cstring(raw_data(device_info.deviceName[:]))
+
+			fmt.printfln("Selected physical device %v with compute+present queue family %d", name, i)
+
+
 			return
 		}
 	}
@@ -262,7 +323,16 @@ create_logical_device :: proc(ctx: ^render.Context) {
 		pQueuePriorities = &priority,
 	}
 
+	// The fullscreen-triangle vertex shader's SV_VertexID lowers to
+	// gl_VertexIndex, which Slang implements relative to gl_BaseVertex and
+	// so requires the SPIR-V DrawParameters capability.
+	features_11 := vk.PhysicalDeviceVulkan11Features {
+		sType                = .PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+		shaderDrawParameters = true,
+	}
+
 	features_12 := vk.PhysicalDeviceVulkan12Features {
+		pNext                                        = &features_11,
 		sType                                        = .PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
 		bufferDeviceAddress                          = true,
 		timelineSemaphore                            = true,
@@ -283,9 +353,16 @@ create_logical_device :: proc(ctx: ^render.Context) {
 		dynamicRendering = true,
 	}
 
+	features_mesh_shader := vk.PhysicalDeviceMeshShaderFeaturesEXT {
+		sType      = .PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT,
+		pNext      = &features_13,
+		meshShader = true,
+		taskShader = true,
+	}
+
 	features_shader_object := vk.PhysicalDeviceShaderObjectFeaturesEXT {
 		sType        = .PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT,
-		pNext        = &features_13,
+		pNext        = &features_mesh_shader,
 		shaderObject = true,
 	}
 
@@ -302,10 +379,39 @@ create_logical_device :: proc(ctx: ^render.Context) {
 		presentWait = true,
 	}
 
+	// Needed to draw with shader objects: no VkPipeline means no baked
+	// vertex input state, so it must be supplied via vkCmdSetVertexInputEXT.
+	features_vertex_input := vk.PhysicalDeviceVertexInputDynamicStateFeaturesEXT {
+		sType                   = .PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT,
+		pNext                   = &features_present_wait,
+		vertexInputDynamicState = true,
+	}
+
+	// Needed to draw with shader objects: rasterization/blend state that a
+	// VkPipeline would otherwise fix at creation time.
+	features_eds3 := vk.PhysicalDeviceExtendedDynamicState3FeaturesEXT {
+		sType = .PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT,
+		pNext = &features_vertex_input,
+		extendedDynamicState3PolygonMode          = true,
+		extendedDynamicState3RasterizationSamples = true,
+		extendedDynamicState3SampleMask           = true,
+		extendedDynamicState3AlphaToCoverageEnable = true,
+		extendedDynamicState3ColorBlendEnable     = true,
+		extendedDynamicState3ColorBlendEquation   = true,
+		extendedDynamicState3ColorWriteMask       = true,
+	}
+
+	// Needed to select VK_PRESENT_MODE_FIFO_LATEST_READY_KHR in create_swapchain.
+	features_present_mode_fifo_latest_ready := vk.PhysicalDevicePresentModeFifoLatestReadyFeaturesKHR {
+		sType                      = .PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR,
+		pNext                      = &features_eds3,
+		presentModeFifoLatestReady = true,
+	}
+
 	device_extensions := REQUIRED_DEVICE_EXTENSIONS
 	device_info := vk.DeviceCreateInfo {
 		sType                   = .DEVICE_CREATE_INFO,
-		pNext                   = &features_present_wait,
+		pNext                   = &features_present_mode_fifo_latest_ready,
 		queueCreateInfoCount    = 1,
 		pQueueCreateInfos       = &queue_info,
 		enabledExtensionCount   = u32(len(device_extensions)),
@@ -320,12 +426,7 @@ create_logical_device :: proc(ctx: ^render.Context) {
 	vk.GetDeviceQueue(ctx.device, ctx.compute_family, 0, &ctx.compute_queue)
 }
 
-// Some presentation engines (e.g. Wayland) report no fixed extent
-// (currentExtent comes back as 0xFFFFFFFF), so fall back to the window size
-// picked in init_window.
-FALLBACK_SWAPCHAIN_EXTENT :: vk.Extent2D{800, 600}
-
-create_swapchain :: proc(ctx: ^render.Context) {
+create_swapchain :: proc(ctx: ^render.Context, old_swapchain: vk.SwapchainKHR = 0) {
 	capabilities: vk.SurfaceCapabilitiesKHR
 	vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(ctx.physical_device, ctx.surface, &capabilities)
 
@@ -350,7 +451,12 @@ create_swapchain :: proc(ctx: ^render.Context) {
 
 	extent := capabilities.currentExtent
 	if extent.width == max(u32) {
-		extent = FALLBACK_SWAPCHAIN_EXTENT
+		// Some presentation engines (e.g. Wayland) report no fixed extent
+		// here, so fall back to the window's actual drawable size.
+		width, height: i32
+		sdl2.Vulkan_GetDrawableSize(ctx.window, &width, &height)
+		extent = vk.Extent2D{u32(width), u32(height)}
+
 		extent.width = clamp(
 			extent.width,
 			capabilities.minImageExtent.width,
@@ -375,14 +481,19 @@ create_swapchain :: proc(ctx: ^render.Context) {
 		defer delete(present_modes)
 		vk.GetPhysicalDeviceSurfacePresentModesKHR(ctx.physical_device, ctx.surface, &present_mode_count, raw_data(present_modes))
 
-		fmt.printfln("Available present modes: %v", present_modes)
+		selected_mode := vk.PresentModeKHR .FIFO
 		for mode in present_modes {
 			if mode == .MAILBOX {
-				return .MAILBOX
+				selected_mode = .MAILBOX
+			}
+
+			if mode == .FIFO_LATEST_READY {
+				selected_mode = .FIFO_LATEST_READY
 			}
 		}
-		fmt.printfln("Selected FIFO present mode as fallback because MAILBOX was not available")
-		return .FIFO
+
+		fmt.printfln("Selected present mode: %v", selected_mode)
+		return selected_mode
 	}
 
 	swapchain_info := vk.SwapchainCreateInfoKHR {
@@ -393,12 +504,13 @@ create_swapchain :: proc(ctx: ^render.Context) {
 		imageColorSpace  = chosen_format.colorSpace,
 		imageExtent      = extent,
 		imageArrayLayers = 1,
-		imageUsage       = {.COLOR_ATTACHMENT, .TRANSFER_DST},
+		imageUsage       = {.COLOR_ATTACHMENT},
 		imageSharingMode = .EXCLUSIVE,
 		preTransform     = capabilities.currentTransform,
 		compositeAlpha   = {.OPAQUE},
 		presentMode      = find_supported_present_mode(ctx),
 		clipped          = true,
+		oldSwapchain     = old_swapchain,
 	}
 	if res := vk.CreateSwapchainKHR(ctx.device, &swapchain_info, nil, &ctx.swapchain.handle);
 	   res != .SUCCESS {
@@ -431,6 +543,46 @@ create_swapchain :: proc(ctx: ^render.Context) {
 			fmt.panicf("failed to create swapchain image view %d: %v", i, res)
 		}
 	}
+}
+
+// Rebuilds the swapchain and everything sized off it (the swapchain-image
+// views, the per-swapchain-image render-finished semaphores, and the
+// offscreen target). Command buffers, the simulation's ping-pong buffers
+// and display image, and the bindless slots they occupy are all untouched:
+// none of them depend on the window size.
+recreate_swapchain :: proc(ctx: ^render.Context) {
+	// A minimized window has a zero-sized drawable area, which Vulkan
+	// rejects as a swapchain extent. Block until it is shown again.
+	width, height: i32
+	sdl2.Vulkan_GetDrawableSize(ctx.window, &width, &height)
+	for width == 0 || height == 0 {
+		sdl2.WaitEventTimeout(nil, 100)
+		sdl2.Vulkan_GetDrawableSize(ctx.window, &width, &height)
+	}
+
+	if res := vk.DeviceWaitIdle(ctx.device); res != .SUCCESS {
+		fmt.panicf("vkDeviceWaitIdle failed before swapchain recreation: %v", res)
+	}
+
+	old_swapchain := ctx.swapchain.handle
+	old_image_views := ctx.swapchain.image_views
+	old_images := ctx.swapchain.images
+
+	create_swapchain(ctx, old_swapchain)
+
+	for view in old_image_views {
+		vk.DestroyImageView(ctx.device, view, nil)
+	}
+	delete(old_image_views)
+	delete(old_images)
+	vk.DestroySwapchainKHR(ctx.device, old_swapchain, nil)
+
+	destroy_render_finished_semaphores(ctx)
+	create_render_finished_semaphores(ctx)
+
+	recreate_offscreen_target(ctx)
+
+	ctx.framebuffer_resized = false
 }
 
 create_pipeline_layout :: proc(ctx: ^render.Context) {
@@ -663,23 +815,303 @@ create_buffer :: proc(ctx: ^render.Context, size: vk.DeviceSize, usage: vk.Buffe
 
 	buffer.device_address = vk.GetBufferDeviceAddress(ctx.device, &address_info)
 
-	cells := (^[config.CELL_COUNT]u32)(buffer.mapped)
-	for i in 0 ..< config.CELL_COUNT {
-		cells[i] = 0
-	}
-
 	return render.resource_add(&ctx.buffer_pool, buffer)
 }
 
-seed_initial_generation :: proc(ctx: ^render.Context) {
-	frame := ctx.frames[2]
-	buffer, found := render.resource_try_get(&ctx.buffer_pool, frame.buffer)
-	if !found {
-		fmt.panicf("failed to get buffer from buffer pool")
+create_image :: proc(
+	ctx: ^render.Context,
+	width: u32,
+	height: u32,
+	format: vk.Format,
+	usage: vk.ImageUsageFlags,
+	aspect: vk.ImageAspectFlags = {.COLOR},
+) -> render.Image_Handle {
+	image: render.Image
+	image.format = format
+
+	image_info := vk.ImageCreateInfo {
+		sType         = .IMAGE_CREATE_INFO,
+		imageType     = .D2,
+		format        = format,
+		extent        = {width, height, 1},
+		mipLevels     = 1,
+		arrayLayers   = 1,
+		samples       = {._1},
+		tiling        = .OPTIMAL,
+		usage         = usage,
+		sharingMode   = .EXCLUSIVE,
+		initialLayout = .UNDEFINED,
 	}
 
-	cells := (^[config.CELL_COUNT]u32)(buffer.mapped)
-	cells[config.CELL_COUNT / 2] = 1
+	if res := vk.CreateImage(ctx.device, &image_info, nil, &image.object); res != .SUCCESS {
+		fmt.panicf("failed to create image: %v", res)
+	}
+
+	mem_reqs: vk.MemoryRequirements
+	vk.GetImageMemoryRequirements(ctx.device, image.object, &mem_reqs)
+
+	mem_props: vk.PhysicalDeviceMemoryProperties
+	vk.GetPhysicalDeviceMemoryProperties(ctx.physical_device, &mem_props)
+
+	mem_type_index := max(u32)
+	wanted := vk.MemoryPropertyFlags{.DEVICE_LOCAL}
+
+	for i in 0 ..< mem_props.memoryTypeCount {
+		if (mem_reqs.memoryTypeBits & (1 << i)) != 0 &&
+		   (mem_props.memoryTypes[i].propertyFlags & wanted) == wanted {
+			mem_type_index = i
+			break
+		}
+	}
+
+	if mem_type_index == max(u32) {
+		vk.DestroyImage(ctx.device, image.object, nil)
+
+		fmt.panicf("no suitable memory type found for image")
+	}
+
+	alloc_info := vk.MemoryAllocateInfo {
+		sType           = .MEMORY_ALLOCATE_INFO,
+		allocationSize  = mem_reqs.size,
+		memoryTypeIndex = mem_type_index,
+	}
+
+	if res := vk.AllocateMemory(ctx.device, &alloc_info, nil, &image.memory); res != .SUCCESS {
+		vk.DestroyImage(ctx.device, image.object, nil)
+
+		fmt.panicf("failed to allocate image memory: %v", res)
+	}
+
+	if res := vk.BindImageMemory(ctx.device, image.object, image.memory, 0); res != .SUCCESS {
+		vk.FreeMemory(ctx.device, image.memory, nil)
+		vk.DestroyImage(ctx.device, image.object, nil)
+
+		fmt.panicf("failed to bind image memory: %v", res)
+	}
+
+	view_info := vk.ImageViewCreateInfo {
+		sType    = .IMAGE_VIEW_CREATE_INFO,
+		image    = image.object,
+		viewType = .D2,
+		format   = format,
+		subresourceRange = {aspectMask = aspect, levelCount = 1, layerCount = 1},
+	}
+
+	if res := vk.CreateImageView(ctx.device, &view_info, nil, &image.view); res != .SUCCESS {
+		vk.FreeMemory(ctx.device, image.memory, nil)
+		vk.DestroyImage(ctx.device, image.object, nil)
+
+		fmt.panicf("failed to create image view: %v", res)
+	}
+
+	return render.resource_add(&ctx.image_pool, image)
+}
+
+// One-shot UNDEFINED -> GENERAL transition so the compute shader can write
+// into the display image on its very first dispatch.
+transition_image_to_general :: proc(ctx: ^render.Context, image: vk.Image) {
+	alloc_info := vk.CommandBufferAllocateInfo {
+		sType              = .COMMAND_BUFFER_ALLOCATE_INFO,
+		commandPool        = ctx.command_pool,
+		level              = .PRIMARY,
+		commandBufferCount = 1,
+	}
+
+	cmd: vk.CommandBuffer
+	if res := vk.AllocateCommandBuffers(ctx.device, &alloc_info, &cmd); res != .SUCCESS {
+		fmt.panicf("failed to allocate one-shot command buffer: %v", res)
+	}
+	defer vk.FreeCommandBuffers(ctx.device, ctx.command_pool, 1, &cmd)
+
+	begin_info := vk.CommandBufferBeginInfo {
+		sType = .COMMAND_BUFFER_BEGIN_INFO,
+		flags = {.ONE_TIME_SUBMIT},
+	}
+
+	if res := vk.BeginCommandBuffer(cmd, &begin_info); res != .SUCCESS {
+		fmt.panicf("failed to begin one-shot command buffer: %v", res)
+	}
+
+	barrier := vk.ImageMemoryBarrier2 {
+		sType               = .IMAGE_MEMORY_BARRIER_2,
+		srcStageMask        = {.TOP_OF_PIPE},
+		dstStageMask        = {.COMPUTE_SHADER},
+		dstAccessMask       = {.SHADER_WRITE},
+		oldLayout           = .UNDEFINED,
+		newLayout           = .GENERAL,
+		srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
+		dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
+		image               = image,
+		subresourceRange    = {aspectMask = {.COLOR}, levelCount = 1, layerCount = 1},
+	}
+
+	dependency_info := vk.DependencyInfo {
+		sType                   = .DEPENDENCY_INFO,
+		imageMemoryBarrierCount = 1,
+		pImageMemoryBarriers    = &barrier,
+	}
+
+	vk.CmdPipelineBarrier2(cmd, &dependency_info)
+
+	if res := vk.EndCommandBuffer(cmd); res != .SUCCESS {
+		fmt.panicf("failed to end one-shot command buffer: %v", res)
+	}
+
+	submit_info := vk.SubmitInfo {
+		sType              = .SUBMIT_INFO,
+		commandBufferCount = 1,
+		pCommandBuffers    = &cmd,
+	}
+
+	if res := vk.QueueSubmit(ctx.compute_queue, 1, &submit_info, 0); res != .SUCCESS {
+		fmt.panicf("failed to submit one-shot command buffer: %v", res)
+	}
+
+	if res := vk.QueueWaitIdle(ctx.compute_queue); res != .SUCCESS {
+		fmt.panicf("failed to wait for one-shot command buffer: %v", res)
+	}
+}
+
+init_simulation :: proc(ctx: ^render.Context) {
+	ctx.simulation.width = config.GRID_WIDTH
+	ctx.simulation.height = config.GRID_HEIGHT
+
+	for i in 0 ..< 2 {
+		ctx.simulation.buffers[i] = create_buffer(
+			ctx,
+			config.BUFFER_SIZE,
+			{.STORAGE_BUFFER, .SHADER_DEVICE_ADDRESS},
+		)
+	}
+
+	// Seed generation zero with a random population in buffers[current],
+	// which run_frame will read as "prev" for the first dispatch.
+	seed_buffer, found := render.resource_try_get(&ctx.buffer_pool, ctx.simulation.buffers[ctx.simulation.current])
+	if !found {
+		fmt.panicf("failed to get simulation seed buffer")
+	}
+	cells := (^[config.CELL_COUNT]u32)(seed_buffer.mapped)
+	for i in 0 ..< config.CELL_COUNT {
+		cells[i] = 1 if rand.float32() < 0.25 else 0
+	}
+
+	ctx.simulation.display_image = create_image(
+		ctx,
+		ctx.simulation.width,
+		ctx.simulation.height,
+		.R8G8B8A8_UNORM,
+		{.STORAGE, .SAMPLED},
+	)
+
+	display_image, image_found := render.resource_try_get(&ctx.image_pool, ctx.simulation.display_image)
+	if !image_found {
+		fmt.panicf("failed to get freshly created display image")
+	}
+
+	transition_image_to_general(ctx, display_image.object)
+
+	storage_handle, storage_ok := render.bindless_allocate_storage_image_2d(ctx, display_image.view)
+	if !storage_ok {
+		fmt.panicf("failed to allocate bindless storage slot for display image")
+	}
+	ctx.simulation.display_image_index = storage_handle.index
+
+	texture_handle, texture_ok := render.bindless_allocate_texture_2d(ctx, display_image.view)
+	if !texture_ok {
+		fmt.panicf("failed to allocate bindless texture slot for display image")
+	}
+	ctx.simulation.display_texture_index = texture_handle.index
+}
+
+// D32_SFLOAT is guaranteed by the Vulkan spec to support the
+// DEPTH_STENCIL_ATTACHMENT usage with optimal tiling, so no format query is
+// needed here.
+DEPTH_FORMAT :: vk.Format.D32_SFLOAT
+
+// The offscreen targets the mesh is drawn into (one per frame-in-flight
+// slot), their depth buffers, and the sampler the swapchain-final pass uses
+// to read an offscreen target (and to read the display image).
+init_render_targets :: proc(ctx: ^render.Context) {
+	for slot in 0 ..< render.MAX_FRAMES_IN_FLIGHT {
+		create_offscreen_image(ctx, slot)
+		create_depth_image(ctx, slot)
+
+		offscreen_image, found := render.resource_try_get(&ctx.image_pool, ctx.offscreen_images[slot])
+		if !found {
+			fmt.panicf("failed to get freshly created offscreen image for slot %d", slot)
+		}
+
+		texture_handle, texture_ok := render.bindless_allocate_texture_2d(ctx, offscreen_image.view)
+		if !texture_ok {
+			fmt.panicf("failed to allocate bindless texture slot for offscreen image %d", slot)
+		}
+		ctx.offscreen_texture_indices[slot] = texture_handle.index
+	}
+
+	sampler_info := vk.SamplerCreateInfo {
+		sType         = .SAMPLER_CREATE_INFO,
+		magFilter     = .NEAREST,
+		minFilter     = .NEAREST,
+		mipmapMode    = .NEAREST,
+		addressModeU  = .CLAMP_TO_EDGE,
+		addressModeV  = .CLAMP_TO_EDGE,
+		addressModeW  = .CLAMP_TO_EDGE,
+		maxLod        = 0,
+	}
+
+	if res := vk.CreateSampler(ctx.device, &sampler_info, nil, &ctx.nearest_sampler); res != .SUCCESS {
+		fmt.panicf("failed to create nearest sampler: %v", res)
+	}
+
+	sampler_handle, sampler_ok := render.bindless_allocate_sampler_2d(ctx, ctx.nearest_sampler)
+	if !sampler_ok {
+		fmt.panicf("failed to allocate bindless slot for nearest sampler")
+	}
+	ctx.nearest_sampler_index = sampler_handle.index
+}
+
+create_offscreen_image :: proc(ctx: ^render.Context, slot: int) {
+	ctx.offscreen_images[slot] = create_image(
+		ctx,
+		ctx.swapchain.extent.width,
+		ctx.swapchain.extent.height,
+		ctx.swapchain.format,
+		{.COLOR_ATTACHMENT, .SAMPLED},
+	)
+}
+
+create_depth_image :: proc(ctx: ^render.Context, slot: int) {
+	ctx.depth_images[slot] = create_image(
+		ctx,
+		ctx.swapchain.extent.width,
+		ctx.swapchain.extent.height,
+		DEPTH_FORMAT,
+		{.DEPTH_STENCIL_ATTACHMENT},
+		{.DEPTH},
+	)
+}
+
+// Called after recreate_swapchain has resized the swapchain: every slot's
+// offscreen target and depth buffer are sized to match it, so all must be
+// rebuilt. Each offscreen target's bindless texture slot is reused in place
+// (see bindless_update_texture_2d) rather than freed and reallocated; the
+// depth images have no bindless slot to update, they are only ever render
+// targets.
+recreate_offscreen_target :: proc(ctx: ^render.Context) {
+	for slot in 0 ..< render.MAX_FRAMES_IN_FLIGHT {
+		render.resource_destroy(ctx, &ctx.image_pool, ctx.offscreen_images[slot])
+		render.resource_destroy(ctx, &ctx.image_pool, ctx.depth_images[slot])
+
+		create_offscreen_image(ctx, slot)
+		create_depth_image(ctx, slot)
+
+		offscreen_image, found := render.resource_try_get(&ctx.image_pool, ctx.offscreen_images[slot])
+		if !found {
+			fmt.panicf("failed to get recreated offscreen image for slot %d", slot)
+		}
+
+		render.bindless_update_texture_2d(ctx, ctx.offscreen_texture_indices[slot], offscreen_image.view)
+	}
 }
 
 find_all_spirv_files_in_directory :: proc(directory: string) -> ds.Dynamic_Array(string) {
@@ -745,6 +1177,16 @@ create_sync_objects :: proc(ctx: ^render.Context) {
 		}
 	}
 
+	create_render_finished_semaphores(ctx)
+}
+
+// Sized to the swapchain's image count, so this is redone whenever the
+// swapchain is recreated (that count can change across recreation).
+create_render_finished_semaphores :: proc(ctx: ^render.Context) {
+	binary_info := vk.SemaphoreCreateInfo {
+		sType = .SEMAPHORE_CREATE_INFO,
+	}
+
 	ctx.render_finished_semaphores = make([]vk.Semaphore, len(ctx.swapchain.images))
 
 	for i in 0 ..< len(ctx.swapchain.images) {
@@ -757,6 +1199,13 @@ create_sync_objects :: proc(ctx: ^render.Context) {
 			fmt.panicf("failed to create render-finished semaphore %d: %v", i, res)
 		}
 	}
+}
+
+destroy_render_finished_semaphores :: proc(ctx: ^render.Context) {
+	for semaphore in ctx.render_finished_semaphores {
+		vk.DestroySemaphore(ctx.device, semaphore, nil)
+	}
+	delete(ctx.render_finished_semaphores)
 }
 
 destroy_buffer :: proc(ctx: ^render.Context, buffer: ^render.Buffer) {
@@ -773,14 +1222,13 @@ cleanup :: proc(ctx: ^render.Context) {
 		vk.DestroySemaphore(ctx.device, ctx.frames[frame].image_available, nil)
 	}
 
+	vk.DestroySampler(ctx.device, ctx.nearest_sampler, nil)
+
 	render.resource_destroy_all(ctx, &ctx.buffer_pool)
 	render.resource_destroy_all(ctx, &ctx.shader_pool)
 	render.resource_destroy_all(ctx, &ctx.image_pool)
 
-	for semaphore in ctx.render_finished_semaphores {
-		vk.DestroySemaphore(ctx.device, semaphore, nil)
-	}
-	delete(ctx.render_finished_semaphores)
+	destroy_render_finished_semaphores(ctx)
 	vk.DestroySemaphore(ctx.device, ctx.timeline_semaphore, nil)
 
 	vk.DestroyPipelineLayout(ctx.device, ctx.pipeline_layout, nil)
