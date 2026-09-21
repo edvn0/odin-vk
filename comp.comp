@@ -1,0 +1,27 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+
+layout(local_size_x = 64) in;
+
+const uint CELL_COUNT = 64;
+const uint RULE_30 = 0x1Eu; // 00011110
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Row {
+    uint cells[];
+};
+
+layout(push_constant) uniform PushConstants {
+    Row prev;
+    Row curr;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+
+    uint left  = pc.prev.cells[(i + CELL_COUNT - 1u) % CELL_COUNT];
+    uint mid   = pc.prev.cells[i];
+    uint right = pc.prev.cells[(i + 1u) % CELL_COUNT];
+
+    uint pattern = (left << 2u) | (mid << 1u) | right;
+    pc.curr.cells[i] = (RULE_30 >> pattern) & 1u;
+}

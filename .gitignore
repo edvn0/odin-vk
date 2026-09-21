@@ -1,0 +1,19 @@
+# Odin build output
+app
+*.bin
+*.exe
+*.dll
+*.dylib
+*.so
+/bin/
+/build/
+
+# Compiled shaders (build artifacts from .slang / .comp / .vert / .frag sources)
+*.spv
+
+# Program output
+rows.txt
+
+# OS / editor
+.DS_Store
+*.swp
