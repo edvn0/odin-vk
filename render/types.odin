@@ -45,9 +45,22 @@ Image :: struct {
 PushConstants :: struct {
 	prev:        vk.DeviceAddress,
 	curr:        vk.DeviceAddress,
+	ubo:         vk.DeviceAddress,
 	width:       u32,
 	height:      u32,
 	image_index: u32,
+}
+
+// One per frame-in-flight slot (see Context.ubo_buffers), written by the CPU
+// every frame and read via device address by both the rendering and compute
+// passes of that frame — the same dt drives the mesh's rotation and the Game
+// of Life compute dispatch. should_step is compute-specific: it gates
+// whether a dispatch actually advances the automaton's generation, letting
+// the simulation run slower than the render/present rate. Layout must match
+// UBO in shaders/include/ubo.slang byte-for-byte.
+UBO :: struct {
+	dt:          f32,
+	should_step: u32,
 }
 
 // Pushed to the fullscreen-triangle vertex+fragment pair used by the
@@ -68,6 +81,7 @@ Sample_Push_Constants :: struct {
 Mesh_Push_Constants :: struct {
 	vertices:      vk.DeviceAddress,
 	bounds:        vk.DeviceAddress,
+	ubo:           vk.DeviceAddress,
 	angle:         f32,
 	aspect:        f32,
 	count:         u32,
@@ -103,6 +117,10 @@ Simulation :: struct {
 	current:          int,
 	generation:       u64,
 	completion_value: u64,
+
+	// Seconds of frame time banked since the automaton last actually
+	// stepped; see config.SIM_STEP_INTERVAL.
+	accumulated_time: f32,
 
 	width:  u32,
 	height: u32,
@@ -140,6 +158,12 @@ Context :: struct {
 	command_pool:    vk.CommandPool,
 	frames:          [MAX_FRAMES_IN_FLIGHT]Frame_Data,
 	simulation:      Simulation,
+
+	// Per-frame UBO (dt/should_step), one per frame-in-flight slot so a
+	// frame still in flight on the GPU is never overwritten by the CPU
+	// preparing a later one. Shared by the rendering and compute passes of
+	// a given frame; see UBO above.
+	ubo_buffers: [MAX_FRAMES_IN_FLIGHT]Buffer_Handle,
 
 	// Offscreen target that the mesh is drawn into first; the
 	// swapchain-final pass then samples it, rather than the mesh pass

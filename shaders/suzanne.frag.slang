@@ -1,5 +1,6 @@
 import bindless;
 import mesh_vertex;
+import ubo;
 
 struct Bounds
 {
@@ -10,6 +11,7 @@ struct PC
 {
     Ptr<Vertex> vertices;
     Ptr<Bounds> bounds;
+    Ptr<UBO> ubo; // unused here, part of the shared PC layout (see suzanne.mesh.slang)
     float angle;
     float aspect;
     uint count;

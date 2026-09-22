@@ -984,6 +984,14 @@ init_simulation :: proc(ctx: ^render.Context) {
 		)
 	}
 
+	for slot in 0 ..< render.MAX_FRAMES_IN_FLIGHT {
+		ctx.ubo_buffers[slot] = create_buffer(
+			ctx,
+			size_of(render.UBO),
+			{.UNIFORM_BUFFER, .SHADER_DEVICE_ADDRESS},
+		)
+	}
+
 	// Seed generation zero with a random population in buffers[current],
 	// which run_frame will read as "prev" for the first dispatch.
 	seed_buffer, found := render.resource_try_get(&ctx.buffer_pool, ctx.simulation.buffers[ctx.simulation.current])

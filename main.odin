@@ -41,7 +41,14 @@ main :: proc() {
 	running := true
 	frame := 0
 
+	perf_frequency := f32(sdl2.GetPerformanceFrequency())
+	last_counter := sdl2.GetPerformanceCounter()
+
 	for running {
+		now_counter := sdl2.GetPerformanceCounter()
+		dt := f32(now_counter - last_counter) / perf_frequency
+		last_counter = now_counter
+
 		event: sdl2.Event
 
 		for sdl2.PollEvent(&event) {
@@ -64,7 +71,7 @@ main :: proc() {
 		}
 
 		slot := frame % render.MAX_FRAMES_IN_FLIGHT
-		switch render.run_frame(&ctx, slot) {
+		switch render.run_frame(&ctx, slot, dt) {
 		case .Submitted:
 			when ODIN_DEBUG {
 				grid := render.simulation_debug_readback(&ctx, context.temp_allocator)

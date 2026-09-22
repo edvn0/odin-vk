@@ -4,6 +4,8 @@ import "core:fmt"
 import "core:math"
 import vk "vendor:vulkan"
 
+import "../config"
+
 wait_timeline :: proc(ctx: ^Context, value: u64) {
 	if value == 0 {
 		return
@@ -44,10 +46,32 @@ wait_timeline :: proc(ctx: ^Context, value: u64) {
 // No CPU readback happens on this path. Use simulation_debug_readback for
 // that, as an explicitly opt-in debug facility.
 //
-run_frame :: proc(ctx: ^Context, slot: int) -> Frame_Result {
+run_frame :: proc(ctx: ^Context, slot: int, dt: f32) -> Frame_Result {
 	wait_timeline(ctx, ctx.frames[slot].completion_value)
 
 	collect_bindless_retirements(ctx)
+
+	// Gate the automaton's generation on accumulated wall-clock time rather
+	// than the render/present rate, so it advances at a fixed pace
+	// regardless of framerate. The compute shader always dispatches (it
+	// still needs to keep the ping-pong buffers and display image
+	// consistent every frame); should_step just tells it whether to apply
+	// the Game of Life rule this time or leave the grid as-is.
+	ctx.simulation.accumulated_time += dt
+	should_step := ctx.simulation.accumulated_time >= config.SIM_STEP_INTERVAL
+	if should_step {
+		ctx.simulation.accumulated_time -= config.SIM_STEP_INTERVAL
+	}
+
+	ubo_buffer, ubo_found := resource_try_get(&ctx.buffer_pool, ctx.ubo_buffers[slot])
+	if !ubo_found {
+		fmt.panicf("failed to get UBO buffer")
+	}
+
+	(^UBO)(ubo_buffer.mapped)^ = UBO {
+		dt          = dt,
+		should_step = 1 if should_step else 0,
+	}
 
 	prev_index := ctx.simulation.current
 	curr_index := 1 - ctx.simulation.current
@@ -117,6 +141,7 @@ run_frame :: proc(ctx: ^Context, slot: int) -> Frame_Result {
 	push := PushConstants {
 		prev        = prev_buffer.device_address,
 		curr        = curr_buffer.device_address,
+		ubo         = ubo_buffer.device_address,
 		width       = ctx.simulation.width,
 		height      = ctx.simulation.height,
 		image_index = ctx.simulation.display_image_index,
@@ -349,6 +374,7 @@ run_frame :: proc(ctx: ^Context, slot: int) -> Frame_Result {
 	mesh_push := Mesh_Push_Constants {
 		vertices      = mesh_buffer.device_address,
 		bounds        = bounds_buffer.device_address,
+		ubo           = ubo_buffer.device_address,
 		angle         = ctx.mesh.rotation,
 		aspect        = f32(ctx.swapchain.extent.width) / f32(ctx.swapchain.extent.height),
 		count         = ctx.mesh.vertex_count,
@@ -600,8 +626,10 @@ run_frame :: proc(ctx: ^Context, slot: int) -> Frame_Result {
 	ctx.simulation.current = curr_index
 	ctx.simulation.generation += 1
 
-	MESH_SPIN_RADIANS_PER_FRAME :: 0.01
-	ctx.mesh.rotation = math.mod(ctx.mesh.rotation + MESH_SPIN_RADIANS_PER_FRAME, 2 * math.PI)
+	// The same dt written into this frame's UBO above, so the mesh spins at
+	// a fixed rate in real time regardless of the render/present rate.
+	MESH_SPIN_RADIANS_PER_SECOND :: 0.6
+	ctx.mesh.rotation = math.mod(ctx.mesh.rotation + MESH_SPIN_RADIANS_PER_SECOND * dt, 2 * math.PI)
 
 	//
 	// Queue presentation, but DO NOT wait for presentation to finish.

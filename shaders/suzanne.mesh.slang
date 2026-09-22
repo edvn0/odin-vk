@@ -1,4 +1,5 @@
 import mesh_vertex;
+import ubo;
 
 struct Bounds
 {
@@ -9,6 +10,7 @@ struct PC
 {
     Ptr<Vertex> vertices;
     Ptr<Bounds> bounds; // unused here, read by the task shader
+    Ptr<UBO> ubo; // unused here, available for future per-frame effects
     float angle;
     float aspect;
     uint count;

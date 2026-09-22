@@ -1,9 +1,11 @@
 import bindless;
+import ubo;
 
 struct PC
 {
     Ptr<uint> prev;
     Ptr<uint> curr;
+    Ptr<UBO> ubo;
 
     uint width;
     uint height;
@@ -47,7 +49,12 @@ void main(
 
     // Conway's Game of Life (B3/S23): a dead cell with exactly 3 live
     // neighbors is born; a live cell survives with 2 or 3 live neighbors.
-    uint alive = (neighbors == 3 || (self != 0 && neighbors == 2)) ? 1 : 0;
+    uint stepped = (neighbors == 3 || (self != 0 && neighbors == 2)) ? 1 : 0;
+
+    // Only actually advance the generation when the CPU says enough time
+    // has accumulated (see UBO); otherwise carry the cell forward unchanged
+    // so the grid stays still between steps.
+    uint alive = pc.ubo[0].should_step != 0 ? stepped : self;
 
     pc.curr[cell_index(x, y, pc.width)] = alive;
 
