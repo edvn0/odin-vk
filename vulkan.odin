@@ -75,7 +75,7 @@ init_vulkan :: proc(ctx: ^render.Context) {
 		engineVersion      = vk.MAKE_VERSION(1, 0, 0),
 		apiVersion         = vk.API_VERSION_1_3,
 	}
-
+	
 	layer_name: cstring
 	if ODIN_DEBUG {
 		layer_name = cstring("VK_LAYER_KHRONOS_validation")
@@ -83,7 +83,7 @@ init_vulkan :: proc(ctx: ^render.Context) {
 		layer_name = nil
 	}
 	layer_count := layer_name != nil ? 1 : 0
-
+	
 	// A real windowed surface is required here: VK_EXT_headless_surface
 	// reports no present support on this system's NVIDIA driver (its
 	// headless surface exists for API compliance only, not actual
@@ -93,19 +93,19 @@ init_vulkan :: proc(ctx: ^render.Context) {
 	sdl_extensions := make([]cstring, ext_count)
 	defer delete(sdl_extensions)
 	sdl2.Vulkan_GetInstanceExtensions(ctx.window, &ext_count, raw_data(sdl_extensions))
-
+	
 	all_extensions := make([]cstring, ext_count + 1)
 	defer delete(all_extensions)
 	copy(all_extensions, sdl_extensions)
 	all_extensions[ext_count] = "VK_EXT_debug_utils"
-
+	
 	debug_info := vk.DebugUtilsMessengerCreateInfoEXT {
 		sType           = .DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
 		messageSeverity = {.VERBOSE, .WARNING, .ERROR},
 		messageType     = {.GENERAL, .VALIDATION, .PERFORMANCE},
 		pfnUserCallback = debug_callback,
 	}
-
+	
 	instance_info := vk.InstanceCreateInfo {
 		sType                   = .INSTANCE_CREATE_INFO,
 		pNext                   = &debug_info,
@@ -115,60 +115,69 @@ init_vulkan :: proc(ctx: ^render.Context) {
 		enabledLayerCount       = u32(layer_count),
 		ppEnabledLayerNames     = layer_count > 0 ? &layer_name : nil,
 	}
-
+	
 	if res := vk.CreateInstance(&instance_info, nil, &ctx.instance); res != .SUCCESS {
 		fmt.panicf("failed to create instance: %v", res)
 	}
 	vk.load_proc_addresses_instance(ctx.instance)
-
+	
 	vk.CreateDebugUtilsMessengerEXT(ctx.instance, &debug_info, nil, &ctx.debug_messenger)
-
-
+	
+	
 	create_surface(ctx)
 	pick_physical_device(ctx)
 	create_logical_device(ctx)
 	vk.load_proc_addresses_device(ctx.device)
-
+	
 	vk.GetPhysicalDeviceProperties(ctx.physical_device, &ctx.physical_device_properties)
 	push_constant_supported_size := min(
 		256,
 		ctx.physical_device_properties.limits.maxPushConstantsSize,
 	)
-
+	
 	if ctx.physical_device_properties.limits.maxPushConstantsSize < 256 {
-		fmt.printfln("Push constants size not supported: %d", ctx.physical_device_properties.limits.maxPushConstantsSize)
-		fmt.panicf("Push constants size not supported: %d", ctx.physical_device_properties.limits.maxPushConstantsSize)
+		fmt.printfln(
+			"Push constants size not supported: %d",
+			ctx.physical_device_properties.limits.maxPushConstantsSize,
+		)
+		fmt.panicf(
+			"Push constants size not supported: %d",
+			ctx.physical_device_properties.limits.maxPushConstantsSize,
+		)
 	}
-
+	
 	fmt.printfln(
 		"Push constants size supported: %d, use %d",
 		ctx.physical_device_properties.limits.maxPushConstantsSize,
 		push_constant_supported_size,
 	)
-
+	
 	ctx.global_push_constant_range = vk.PushConstantRange {
 		stageFlags = vk.ShaderStageFlags_ALL,
 		offset     = 0,
 		size       = push_constant_supported_size,
 	}
-
+	
 	create_descriptor_set_layout(ctx)
+	render.init_resource_pools(ctx)
 	render.create_bindless_descriptor_set(ctx)
 	create_pipeline_layout(ctx)
 
 	create_swapchain(ctx)
 	create_command_pool(ctx)
-	render.init_resource_pools(ctx)
+	
+	init_rendering(ctx)
+	
 	init_simulation(ctx)
 	init_render_targets(ctx)
 	init_mesh(ctx, "./assets/suzanne.obj")
 	create_sync_objects(ctx)
-
+	
 	ctx.shaders = make(map[render.Shader_Key]render.Shader_Handle)
-
+	
 	files := find_all_spirv_files_in_directory("./shaders")
 	defer ds.destroy(&files)
-
+	
 	// A mesh shader must declare NO_TASK_SHADER when it has no accompanying
 	// task shader (see load_spirv_file); find out which mesh shader names
 	// do have one by name (e.g. "suzanne.task.spv" pairs with
@@ -816,93 +825,6 @@ create_command_pool :: proc(ctx: ^render.Context) {
 	}
 }
 
-create_buffer :: proc(
-	ctx: ^render.Context,
-	size: vk.DeviceSize,
-	usage: vk.BufferUsageFlags = {.STORAGE_BUFFER, .SHADER_DEVICE_ADDRESS},
-) -> render.Buffer_Handle {
-	buffer: render.Buffer
-
-	usage_with_device_address := usage | {.SHADER_DEVICE_ADDRESS}
-	buffer_info := vk.BufferCreateInfo {
-		sType       = .BUFFER_CREATE_INFO,
-		size        = size,
-		usage       = usage_with_device_address,
-		sharingMode = .EXCLUSIVE,
-	}
-
-	if res := vk.CreateBuffer(ctx.device, &buffer_info, nil, &buffer.object); res != .SUCCESS {
-		fmt.panicf("failed to create buffer: %v", res)
-	}
-
-	mem_reqs: vk.MemoryRequirements
-	vk.GetBufferMemoryRequirements(ctx.device, buffer.object, &mem_reqs)
-
-	mem_props: vk.PhysicalDeviceMemoryProperties
-	vk.GetPhysicalDeviceMemoryProperties(ctx.physical_device, &mem_props)
-
-	mem_type_index := max(u32)
-	wanted := vk.MemoryPropertyFlags{.HOST_VISIBLE, .HOST_COHERENT}
-
-	for i in 0 ..< mem_props.memoryTypeCount {
-		if (mem_reqs.memoryTypeBits & (1 << i)) != 0 &&
-		   (mem_props.memoryTypes[i].propertyFlags & wanted) == wanted {
-			mem_type_index = i
-			break
-		}
-	}
-
-	if mem_type_index == max(u32) {
-		vk.DestroyBuffer(ctx.device, buffer.object, nil)
-
-		fmt.panicf("no suitable memory type found")
-	}
-
-	alloc_flags := vk.MemoryAllocateFlagsInfo {
-		sType = .MEMORY_ALLOCATE_FLAGS_INFO,
-		flags = {.DEVICE_ADDRESS},
-	}
-
-	alloc_info := vk.MemoryAllocateInfo {
-		sType           = .MEMORY_ALLOCATE_INFO,
-		pNext           = &alloc_flags,
-		allocationSize  = mem_reqs.size,
-		memoryTypeIndex = mem_type_index,
-	}
-
-	if res := vk.AllocateMemory(ctx.device, &alloc_info, nil, &buffer.memory); res != .SUCCESS {
-		vk.DestroyBuffer(ctx.device, buffer.object, nil)
-
-		fmt.panicf("failed to allocate buffer memory: %v", res)
-	}
-
-	if res := vk.BindBufferMemory(ctx.device, buffer.object, buffer.memory, 0); res != .SUCCESS {
-		vk.FreeMemory(ctx.device, buffer.memory, nil)
-
-		vk.DestroyBuffer(ctx.device, buffer.object, nil)
-
-		fmt.panicf("failed to bind buffer memory: %v", res)
-	}
-
-	if res := vk.MapMemory(ctx.device, buffer.memory, 0, size, {}, &buffer.mapped);
-	   res != .SUCCESS {
-		vk.FreeMemory(ctx.device, buffer.memory, nil)
-
-		vk.DestroyBuffer(ctx.device, buffer.object, nil)
-
-		fmt.panicf("failed to map buffer memory: %v", res)
-	}
-
-	address_info := vk.BufferDeviceAddressInfo {
-		sType  = .BUFFER_DEVICE_ADDRESS_INFO,
-		buffer = buffer.object,
-	}
-
-	buffer.device_address = vk.GetBufferDeviceAddress(ctx.device, &address_info)
-
-	return render.resource_add(&ctx.buffer_pool, buffer)
-}
-
 create_image :: proc(
 	ctx: ^render.Context,
 	width: u32,
@@ -1057,28 +979,23 @@ transition_image_to_general :: proc(ctx: ^render.Context, image: vk.Image) {
 	}
 }
 
+init_rendering :: proc(ctx: ^render.Context) {
+	for slot in 0 ..< render.MAX_FRAMES_IN_FLIGHT {
+		ctx.ubo_buffers[slot] = render.create_buffer(ctx, size_of(render.UBO), {.UNIFORM_BUFFER})
+	}
+}
+
 init_simulation :: proc(ctx: ^render.Context) {
 	ctx.simulation.width = config.GRID_WIDTH
 	ctx.simulation.height = config.GRID_HEIGHT
 
 	for i in 0 ..< 2 {
-		ctx.simulation.buffers[i] = create_buffer(
+		ctx.simulation.buffers[i] = render.create_buffer(
 			ctx,
 			config.BUFFER_SIZE,
-			{.STORAGE_BUFFER, .SHADER_DEVICE_ADDRESS},
+			{.STORAGE_BUFFER},
 		)
 	}
-
-	for slot in 0 ..< render.MAX_FRAMES_IN_FLIGHT {
-		ctx.ubo_buffers[slot] = create_buffer(
-			ctx,
-			size_of(render.UBO),
-			{.UNIFORM_BUFFER, .SHADER_DEVICE_ADDRESS},
-		)
-	}
-
-	// Seed generation zero with a random population in buffers[current],
-	// which run_frame will read as "prev" for the first dispatch.
 	seed_buffer, found := render.resource_try_get(
 		&ctx.buffer_pool,
 		ctx.simulation.buffers[ctx.simulation.current],
@@ -1125,14 +1042,8 @@ init_simulation :: proc(ctx: ^render.Context) {
 	ctx.simulation.display_texture_index = texture_handle.index
 }
 
-// D32_SFLOAT is guaranteed by the Vulkan spec to support the
-// DEPTH_STENCIL_ATTACHMENT usage with optimal tiling, so no format query is
-// needed here.
 DEPTH_FORMAT :: vk.Format.D32_SFLOAT
 
-// The offscreen targets the mesh is drawn into (one per frame-in-flight
-// slot), their depth buffers, and the sampler the swapchain-final pass uses
-// to read an offscreen target (and to read the display image).
 init_render_targets :: proc(ctx: ^render.Context) {
 	for slot in 0 ..< render.MAX_FRAMES_IN_FLIGHT {
 		create_offscreen_image(ctx, slot)
@@ -1348,6 +1259,11 @@ cleanup :: proc(ctx: ^render.Context) {
 	render.resource_destroy_all(ctx, &ctx.buffer_pool)
 	render.resource_destroy_all(ctx, &ctx.shader_pool)
 	render.resource_destroy_all(ctx, &ctx.image_pool)
+
+	delete(ctx.draw_stream.draw_data)
+	delete(ctx.draw_stream.submissions)
+	ctx.draw_stream.draw_data = nil
+	ctx.draw_stream.submissions = nil
 
 	destroy_render_finished_semaphores(ctx)
 	vk.DestroySemaphore(ctx.device, ctx.timeline_semaphore, nil)

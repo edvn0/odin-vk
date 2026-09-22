@@ -23,7 +23,7 @@ float3 transform_position(DrawData data, float3 p)
 }
 
 
-public void transform(in DrawData data, out DecodedVertex vertex)
+public void transform(in DrawData data, DecodedVertex vertex)
 {
     vertex.position = transform_position(data, vertex.position);
 }

@@ -1,16 +1,13 @@
 package main
 
-import "core:fmt"
-import "vendor:sdl2"
-import "render"
 import "core:debug/trace"
+import "core:fmt"
+import "maths"
+import "render"
+import "vendor:sdl2"
 import vk_io "vk_io"
 
-write_grid_snapshot :: proc(
-	io: ^vk_io.IO_State,
-	cells: []u32,
-	width: u32,
-) {
+write_grid_snapshot :: proc(io: ^vk_io.IO_State, cells: []u32, width: u32) {
 	height := u32(len(cells)) / width
 	buffer := make([]u8, len(cells) + int(height), context.temp_allocator)
 
@@ -58,6 +55,9 @@ _main :: proc() {
 	perf_frequency := f32(sdl2.GetPerformanceFrequency())
 	last_counter := sdl2.GetPerformanceCounter()
 
+	capture: render.Screenshot_Handle
+	capture_pending := false
+
 	for running {
 		now_counter := sdl2.GetPerformanceCounter()
 		dt := f32(now_counter - last_counter) / perf_frequency
@@ -78,12 +78,65 @@ _main :: proc() {
 			   (event.window.event == .RESIZED || event.window.event == .SIZE_CHANGED) {
 				ctx.framebuffer_resized = true
 			}
+
+			if event.type == .KEYDOWN {
+				if event.key.keysym.sym == .ESCAPE {
+					running = false
+				}
+
+				ctrl_down := (event.key.keysym.mod & sdl2.KMOD_CTRL) != {}
+
+				if ctrl_down &&
+				   event.key.keysym.sym == .p &&
+				   event.key.repeat == 0 &&
+				   !capture_pending {
+					capture = render.screenshot_request(&ctx, {target = .Offscreen})
+
+					capture_pending = true
+					fmt.println("screenshot requested")
+				}
+			}
+
 		}
 
 		if ctx.framebuffer_resized {
 			recreate_swapchain(&ctx)
 		}
 
+		render.begin_frame(&ctx)
+
+		render.submit_mesh(
+			&ctx,
+			ctx.mesh,
+			render.Draw_Data {
+				quat_rotation = maths.make_quat(0, 0, 0, 1),
+				translation = maths.make_vec3(0, 1, 0),
+				scale = 1.0,
+				material_index = 0,
+			},
+		)
+
+		render.submit_mesh(
+			&ctx,
+			ctx.mesh,
+			render.Draw_Data {
+				quat_rotation = maths.make_quat(0, 0, 0, 1),
+				translation = maths.make_vec3(-1, 0, -3),
+				scale = 1.0,
+				material_index = 4,
+			},
+		)
+
+		render.submit_mesh(
+			&ctx,
+			ctx.mesh,
+			render.Draw_Data {
+				quat_rotation = maths.make_quat(0, 0, 0, 1),
+				translation = maths.make_vec3(0, 1, 2),
+				scale = 1.0,
+				material_index = 7,
+			},
+		)
 		slot := frame % render.MAX_FRAMES_IN_FLIGHT
 		switch render.run_frame(&ctx, slot, dt) {
 		case .Submitted:
@@ -91,14 +144,18 @@ _main :: proc() {
 				grid := render.simulation_debug_readback(&ctx, context.temp_allocator)
 				write_grid_snapshot(&ctx.io, grid, ctx.simulation.width)
 			}
-
 			frame += 1
-
 		case .Skipped:
-		// Nothing was ready this tick; try again next iteration.
-
 		case .Swapchain_Out_Of_Date:
 			recreate_swapchain(&ctx)
+		}
+
+		render.screenshot_poll(&ctx)
+
+		if capture_pending && render.screenshot_status(&ctx, capture) == .Ready {
+			// consume it
+			render.screenshot_release(&ctx, capture)
+			capture_pending = false
 		}
 	}
 }

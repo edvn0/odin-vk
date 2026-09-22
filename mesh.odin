@@ -432,7 +432,7 @@ init_mesh :: proc(ctx: ^render.Context, obj_path: string) {
 	}
 
 	size := vk.DeviceSize(vertex_count) * size_of(Mesh_Vertex)
-	handle := create_buffer(ctx, size, {.STORAGE_BUFFER, .SHADER_DEVICE_ADDRESS})
+	handle := render.create_buffer(ctx, size, {.STORAGE_BUFFER})
 
 	buffer, found := render.resource_try_get(&ctx.buffer_pool, handle)
 	if !found {
@@ -447,7 +447,7 @@ init_mesh :: proc(ctx: ^render.Context, obj_path: string) {
 	bounds := compute_meshlet_bounds(vertices, meshlet_count, context.temp_allocator)
 
 	bounds_size := vk.DeviceSize(meshlet_count) * size_of(Meshlet_Bounds)
-	bounds_handle := create_buffer(ctx, bounds_size, {.STORAGE_BUFFER, .SHADER_DEVICE_ADDRESS})
+	bounds_handle := render.create_buffer(ctx, bounds_size, {.STORAGE_BUFFER})
 
 	bounds_buffer, bounds_found := render.resource_try_get(&ctx.buffer_pool, bounds_handle)
 	if !bounds_found {

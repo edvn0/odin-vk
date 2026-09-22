@@ -32,31 +32,71 @@ wait_timeline :: proc(ctx: ^Context, value: u64) {
 	}
 }
 
-//
-// Each frame does two independent things and one draw:
-//
-//   previous simulation buffer -> Game of Life compute -> current simulation
-//   buffer -> display image (full grid). Kept running per current design,
-//   but nothing samples the display image any more (see Mesh in types.odin).
-//
-//   Suzanne mesh buffer -> mesh shader (pass A, one meshlet per workgroup,
-//   depth-tested) -> offscreen target -> fragment shader (pass B, sampled
-//   draw) -> swapchain.
-//
-// No CPU readback happens on this path. Use simulation_debug_readback for
-// that, as an explicitly opt-in debug facility.
-//
+DRAW_DATA_INITIAL_CAPACITY :: 64
+
+ensure_draw_data_capacity :: proc(ctx: ^Context, slot: int, required: int) {
+	if required <= ctx.draw_stream.capacities[slot] {
+		return
+	}
+
+	new_capacity := max(DRAW_DATA_INITIAL_CAPACITY, ctx.draw_stream.capacities[slot])
+
+	for new_capacity < required {
+		new_capacity *= 2
+	}
+
+	new_buffer := create_buffer(
+		ctx,
+		vk.DeviceSize(size_of(Draw_Data) * new_capacity),
+		{.STORAGE_BUFFER, .SHADER_DEVICE_ADDRESS},
+	)
+
+	old_capacity := ctx.draw_stream.capacities[slot]
+	old_buffer := ctx.draw_stream.buffers[slot]
+
+	ctx.draw_stream.buffers[slot] = new_buffer
+	ctx.draw_stream.capacities[slot] = new_capacity
+
+	if old_capacity > 0 {
+		resource_destroy(ctx, &ctx.buffer_pool, old_buffer)
+	}
+}
+
+begin_frame :: proc(ctx: ^Context) {
+	clear(&ctx.draw_stream.draw_data)
+	clear(&ctx.draw_stream.submissions)
+}
+
+submit_mesh :: proc(ctx: ^Context, mesh: Mesh, draw_data: Draw_Data) {
+	draw_index := u32(len(ctx.draw_stream.draw_data))
+
+	append(&ctx.draw_stream.draw_data, draw_data)
+
+	append(
+		&ctx.draw_stream.submissions,
+		Mesh_Submission{mesh = mesh, draw_data_index = draw_index},
+	)
+}
+
 run_frame :: proc(ctx: ^Context, slot: int, dt: f32) -> Frame_Result {
 	wait_timeline(ctx, ctx.frames[slot].completion_value)
 
+	draw_count := len(ctx.draw_stream.draw_data)
+	ensure_draw_data_capacity(ctx, slot, draw_count)
+	draw_data_address: vk.DeviceAddress
+	if draw_count > 0 {
+		draw_buffer, found := resource_try_get(&ctx.buffer_pool, ctx.draw_stream.buffers[slot])
+		if !found {
+			fmt.panicf("failed to get draw data buffer")
+		}
+
+		dst := ([^]Draw_Data)(draw_buffer.mapped)
+		copy(dst[:draw_count], ctx.draw_stream.draw_data[:])
+		draw_data_address = draw_buffer.device_address
+	}
+
 	collect_bindless_retirements(ctx)
 
-	// Gate the automaton's generation on accumulated wall-clock time rather
-	// than the render/present rate, so it advances at a fixed pace
-	// regardless of framerate. The compute shader always dispatches (it
-	// still needs to keep the ping-pong buffers and display image
-	// consistent every frame); should_step just tells it whether to apply
-	// the Game of Life rule this time or leave the grid as-is.
 	ctx.simulation.accumulated_time += dt
 	should_step := ctx.simulation.accumulated_time >= config.SIM_STEP_INTERVAL
 	if should_step {
@@ -71,17 +111,24 @@ run_frame :: proc(ctx: ^Context, slot: int, dt: f32) -> Frame_Result {
 	(^UBO)(ubo_buffer.mapped)^ = UBO {
 		dt          = dt,
 		should_step = 1 if should_step else 0,
+		draw_data   = draw_data_address,
 	}
 
 	prev_index := ctx.simulation.current
 	curr_index := 1 - ctx.simulation.current
 
-	prev_buffer, prev_found := resource_try_get(&ctx.buffer_pool, ctx.simulation.buffers[prev_index])
+	prev_buffer, prev_found := resource_try_get(
+		&ctx.buffer_pool,
+		ctx.simulation.buffers[prev_index],
+	)
 	if !prev_found {
 		fmt.panicf("failed to get previous simulation buffer")
 	}
 
-	curr_buffer, curr_found := resource_try_get(&ctx.buffer_pool, ctx.simulation.buffers[curr_index])
+	curr_buffer, curr_found := resource_try_get(
+		&ctx.buffer_pool,
+		ctx.simulation.buffers[curr_index],
+	)
 	if !curr_found {
 		fmt.panicf("failed to get current simulation buffer")
 	}
@@ -168,7 +215,10 @@ run_frame :: proc(ctx: ^Context, slot: int, dt: f32) -> Frame_Result {
 		layerCount = 1,
 	}
 
-	offscreen_image, offscreen_found := resource_try_get(&ctx.image_pool, ctx.offscreen_images[slot])
+	offscreen_image, offscreen_found := resource_try_get(
+		&ctx.image_pool,
+		ctx.offscreen_images[slot],
+	)
 	if !offscreen_found {
 		fmt.panicf("failed to get offscreen image")
 	}
@@ -317,30 +367,30 @@ run_frame :: proc(ctx: ^Context, slot: int, dt: f32) -> Frame_Result {
 	vk.CmdSetCullMode(cmd, {.BACK})
 
 	offscreen_attachment := vk.RenderingAttachmentInfo {
-		sType       = .RENDERING_ATTACHMENT_INFO,
-		imageView   = offscreen_image.view,
+		sType = .RENDERING_ATTACHMENT_INFO,
+		imageView = offscreen_image.view,
 		imageLayout = .COLOR_ATTACHMENT_OPTIMAL,
-		loadOp      = .CLEAR,
-		storeOp     = .STORE,
-		clearValue  = {color = {float32 = {0.05, 0.05, 0.08, 1}}},
+		loadOp = .CLEAR,
+		storeOp = .STORE,
+		clearValue = {color = {float32 = {0.05, 0.05, 0.08, 1}}},
 	}
 
 	depth_attachment := vk.RenderingAttachmentInfo {
-		sType       = .RENDERING_ATTACHMENT_INFO,
-		imageView   = depth_image.view,
+		sType = .RENDERING_ATTACHMENT_INFO,
+		imageView = depth_image.view,
 		imageLayout = .DEPTH_ATTACHMENT_OPTIMAL,
-		loadOp      = .CLEAR,
-		storeOp     = .DONT_CARE,
-		clearValue  = {depthStencil = {depth = 1}},
+		loadOp = .CLEAR,
+		storeOp = .DONT_CARE,
+		clearValue = {depthStencil = {depth = 1}},
 	}
 
 	offscreen_rendering_info := vk.RenderingInfo {
-		sType                = .RENDERING_INFO,
-		renderArea           = {extent = ctx.swapchain.extent},
-		layerCount           = 1,
+		sType = .RENDERING_INFO,
+		renderArea = {extent = ctx.swapchain.extent},
+		layerCount = 1,
 		colorAttachmentCount = 1,
-		pColorAttachments    = &offscreen_attachment,
-		pDepthAttachment     = &depth_attachment,
+		pColorAttachments = &offscreen_attachment,
+		pDepthAttachment = &depth_attachment,
 	}
 
 	vk.CmdBeginRendering(cmd, &offscreen_rendering_info)
@@ -350,7 +400,10 @@ run_frame :: proc(ctx: ^Context, slot: int, dt: f32) -> Frame_Result {
 		fmt.panicf("failed to get mesh vertex buffer")
 	}
 
-	bounds_buffer, bounds_buffer_found := resource_try_get(&ctx.buffer_pool, ctx.mesh.bounds_buffer)
+	bounds_buffer, bounds_buffer_found := resource_try_get(
+		&ctx.buffer_pool,
+		ctx.mesh.bounds_buffer,
+	)
 	if !bounds_buffer_found {
 		fmt.panicf("failed to get mesh bounds buffer")
 	}
@@ -380,7 +433,8 @@ run_frame :: proc(ctx: ^Context, slot: int, dt: f32) -> Frame_Result {
 	// workgroups then amplifies into up to TASK_GROUP_MESHLETS mesh
 	// workgroups of its own via DispatchMesh.
 	MESH_TASK_GROUP_MESHLETS :: 32
-	task_group_count := (ctx.mesh.meshlet_count + MESH_TASK_GROUP_MESHLETS - 1) / MESH_TASK_GROUP_MESHLETS
+	task_group_count :=
+		(ctx.mesh.meshlet_count + MESH_TASK_GROUP_MESHLETS - 1) / MESH_TASK_GROUP_MESHLETS
 	vk.CmdDrawMeshTasksEXT(cmd, task_group_count, 1, 1)
 
 	vk.CmdEndRendering(cmd)
@@ -457,11 +511,11 @@ run_frame :: proc(ctx: ^Context, slot: int, dt: f32) -> Frame_Result {
 	}
 
 	swapchain_rendering_info := vk.RenderingInfo {
-		sType                = .RENDERING_INFO,
-		renderArea           = {extent = ctx.swapchain.extent},
-		layerCount           = 1,
+		sType = .RENDERING_INFO,
+		renderArea = {extent = ctx.swapchain.extent},
+		layerCount = 1,
 		colorAttachmentCount = 1,
-		pColorAttachments    = &swapchain_attachment,
+		pColorAttachments = &swapchain_attachment,
 	}
 
 	vk.CmdBeginRendering(cmd, &swapchain_rendering_info)
@@ -488,7 +542,12 @@ run_frame :: proc(ctx: ^Context, slot: int, dt: f32) -> Frame_Result {
 		{},
 		sample_fragment_shader.object,
 	}
-	vk.CmdBindShadersEXT(cmd, 7, raw_data(classic_pass_stages[:]), raw_data(classic_pass_shaders[:]))
+	vk.CmdBindShadersEXT(
+		cmd,
+		7,
+		raw_data(classic_pass_stages[:]),
+		raw_data(classic_pass_shaders[:]),
+	)
 
 	vk.CmdSetDepthTestEnable(cmd, false)
 	vk.CmdSetDepthWriteEnable(cmd, false)
@@ -613,7 +672,10 @@ run_frame :: proc(ctx: ^Context, slot: int, dt: f32) -> Frame_Result {
 	// The same dt written into this frame's UBO above, so the mesh spins at
 	// a fixed rate in real time regardless of the render/present rate.
 	MESH_SPIN_RADIANS_PER_SECOND :: 0.6
-	ctx.mesh.rotation = math.mod(ctx.mesh.rotation + MESH_SPIN_RADIANS_PER_SECOND * dt, 2 * math.PI)
+	ctx.mesh.rotation = math.mod(
+		ctx.mesh.rotation + MESH_SPIN_RADIANS_PER_SECOND * dt,
+		2 * math.PI,
+	)
 
 	//
 	// Queue presentation, but DO NOT wait for presentation to finish.
@@ -670,7 +732,10 @@ run_frame :: proc(ctx: ^Context, slot: int, dt: f32) -> Frame_Result {
 simulation_debug_readback :: proc(ctx: ^Context, allocator := context.allocator) -> []u32 {
 	wait_timeline(ctx, ctx.simulation.completion_value)
 
-	buffer, found := resource_try_get(&ctx.buffer_pool, ctx.simulation.buffers[ctx.simulation.current])
+	buffer, found := resource_try_get(
+		&ctx.buffer_pool,
+		ctx.simulation.buffers[ctx.simulation.current],
+	)
 	if !found {
 		fmt.panicf("failed to get current simulation buffer for debug readback")
 	}
