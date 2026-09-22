@@ -39,6 +39,7 @@ Image :: struct {
 	memory: vk.DeviceMemory,
 	view:   vk.ImageView,
 	format: vk.Format,
+	extent: vk.Extent3D,
 }
 
 PushConstants :: struct {
@@ -158,6 +159,7 @@ Screenshot_Request :: struct {
 	frame_number:     u64,
 	width:            u32,
 	height:           u32,
+	row_stride:       u32,
 	format:           vk.Format,
 }
 

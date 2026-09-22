@@ -835,12 +835,13 @@ create_image :: proc(
 ) -> render.Image_Handle {
 	image: render.Image
 	image.format = format
+	image.extent = {width, height, 1}
 
 	image_info := vk.ImageCreateInfo {
 		sType         = .IMAGE_CREATE_INFO,
 		imageType     = .D2,
 		format        = format,
-		extent        = {width, height, 1},
+		extent        = image.extent,
 		mipLevels     = 1,
 		arrayLayers   = 1,
 		samples       = {._1},
@@ -1096,7 +1097,7 @@ create_offscreen_image :: proc(ctx: ^render.Context, slot: int) {
 		ctx.swapchain.extent.width,
 		ctx.swapchain.extent.height,
 		ctx.swapchain.format,
-		{.COLOR_ATTACHMENT, .SAMPLED},
+		{.COLOR_ATTACHMENT, .SAMPLED, .TRANSFER_SRC},
 	)
 }
 

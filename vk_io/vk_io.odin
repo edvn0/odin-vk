@@ -191,3 +191,104 @@ on_write_completed :: proc(op: ^nbio.Operation, req: ^Write_Request) {
 
 	intrinsics.atomic_sub(&io.pending_writes, 1)
 }
+
+//
+// Writes `data` to its own file at `path` (created/truncated), fully
+// asynchronously: open, write, and close are all issued on the io thread's
+// event loop. Unlike write_async, which appends to the single long-lived
+// OUTPUT_PATH file, this opens and closes a fresh file per call -- used for
+// one-off outputs such as screenshot captures.
+//
+// `data` is copied before this returns, so the caller's buffer (or backing
+// storage it points into) may be freed/reused immediately afterward.
+//
+File_Write_Request :: struct {
+	io:   ^IO_State,
+	data: []u8,
+}
+
+write_file_async :: proc(io: ^IO_State, path: string, data: []u8) -> bool {
+	if len(data) == 0 {
+		return true
+	}
+
+	if intrinsics.atomic_load(&io.stop_requested) != 0 {
+		return false
+	}
+
+	heap := runtime.heap_allocator()
+
+	req := new(File_Write_Request, heap)
+	if req == nil {
+		fmt.eprintln("could not allocate async file write request")
+		return false
+	}
+
+	req.io = io
+
+	req.data = make([]u8, len(data), heap)
+	if req.data == nil {
+		free(req, heap)
+		fmt.eprintln("could not allocate async file write buffer")
+		return false
+	}
+
+	copy(req.data, data)
+
+	// Must happen before publishing the operation. The callback may execute
+	// immediately after nbio sees it.
+	intrinsics.atomic_add(&io.pending_writes, 1)
+
+	nbio.open_poly(
+		path,
+		req,
+		on_capture_file_opened,
+		mode = {.Write, .Create, .Trunc},
+		l = io.loop,
+	)
+
+	return true
+}
+
+on_capture_file_opened :: proc(op: ^nbio.Operation, req: ^File_Write_Request) {
+	if op.open.err != nil {
+		fmt.eprintln("async file open failed:", op.open.err)
+		finish_file_write(req)
+		return
+	}
+
+	nbio.write_poly(
+		op.open.handle,
+		0,
+		req.data,
+		req,
+		on_capture_file_written,
+		l = req.io.loop,
+	)
+}
+
+on_capture_file_written :: proc(op: ^nbio.Operation, req: ^File_Write_Request) {
+	if op.write.err != nil {
+		fmt.eprintln("async file write failed:", op.write.err)
+	}
+
+	nbio.close_poly(op.write.handle, req, on_capture_file_closed, l = req.io.loop)
+}
+
+on_capture_file_closed :: proc(op: ^nbio.Operation, req: ^File_Write_Request) {
+	if op.close.err != nil {
+		fmt.eprintln("async file close failed:", op.close.err)
+	}
+
+	finish_file_write(req)
+}
+
+finish_file_write :: proc(req: ^File_Write_Request) {
+	io := req.io
+	heap := runtime.heap_allocator()
+
+	delete(req.data, heap)
+	free(req, heap)
+
+	intrinsics.atomic_sub(&io.pending_writes, 1)
+}

@@ -160,6 +160,19 @@ run_frame :: proc(ctx: ^Context, slot: int, dt: f32) -> Frame_Result {
 		fmt.panicf("failed to acquire swapchain image: %v", acquire_result)
 	}
 
+	// Locate at most one queued screenshot to attach to this frame. The
+	// request stays Queued (and is retried next frame) if we bail out below
+	// before a successful QueueSubmit.
+	screenshot_handle: Screenshot_Handle
+	screenshot_attached := false
+	for &req in ctx.screenshots.requests {
+		if req.state == .Queued {
+			screenshot_handle = req.handle
+			screenshot_attached = true
+			break
+		}
+	}
+
 	swapchain_image := ctx.swapchain.images[image_index]
 
 	render_finished := ctx.render_finished_semaphores[image_index]
@@ -570,6 +583,13 @@ run_frame :: proc(ctx: ^Context, slot: int, dt: f32) -> Frame_Result {
 
 	vk.CmdEndRendering(cmd)
 
+	// Pass B has now finished sampling the offscreen target, so it is safe
+	// to copy it out. Must happen before the offscreen image's layout is
+	// touched again (it isn't, until next frame's UNDEFINED-sourced clear).
+	if screenshot_attached {
+		record_screenshot_readback(ctx, cmd, screenshot_handle, offscreen_image)
+	}
+
 	//
 	// Swapchain image -> presentation.
 	//
@@ -668,6 +688,16 @@ run_frame :: proc(ctx: ^Context, slot: int, dt: f32) -> Frame_Result {
 	ctx.simulation.completion_value = submission_value
 	ctx.simulation.current = curr_index
 	ctx.simulation.generation += 1
+	ctx.frame_number += 1
+
+	if screenshot_attached {
+		req, req_found := screenshot_try_get(ctx, screenshot_handle)
+		if req_found {
+			req.state = .Submitted
+			req.completion_value = submission_value
+			req.frame_number = ctx.frame_number
+		}
+	}
 
 	// The same dt written into this frame's UBO above, so the mesh spins at
 	// a fixed rate in real time regardless of the render/present rate.
