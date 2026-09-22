@@ -2,5 +2,9 @@
     "$schema": "https://raw.githubusercontent.com/DanielGavin/ols/master/misc/ols.schema.json",
     "enable_document_symbols": true,
     "enable_hover": true,
-    "enable_snippets": true
+    "enable_snippets": true,
+    "enable_overload_resolution": true,
+    "enable_procedure_context": true,
+    "enable_semantic_tokens": true,
+    "thread_pool_count": 20
 }

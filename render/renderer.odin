@@ -252,15 +252,6 @@ run_frame :: proc(ctx: ^Context, slot: int, dt: f32) -> Frame_Result {
 	}
 
 	vk.CmdPipelineBarrier2(cmd, &pre_pass_a_deps)
-
-	//
-	// VK_EXT_shader_object replaces VkPipeline, so every piece of
-	// fixed-function graphics state a pipeline would otherwise fix at
-	// creation time must be set explicitly here. State that both passes
-	// share (viewport, rasterization, blend, ...) is set once; shader
-	// bindings and depth test state differ per pass and are set again
-	// before each draw.
-	//
 	vk.CmdBindDescriptorSets(cmd, .GRAPHICS, ctx.pipeline_layout, 0, 1, &ctx.bindless.set, 0, nil)
 
 	viewport := vk.Viewport {
@@ -293,13 +284,6 @@ run_frame :: proc(ctx: ^Context, slot: int, dt: f32) -> Frame_Result {
 	color_write_mask := vk.ColorComponentFlags{.R, .G, .B, .A}
 	vk.CmdSetColorWriteMaskEXT(cmd, 0, 1, &color_write_mask)
 
-	//
-	// Pass A: draw the Suzanne mesh into the offscreen target, depth tested.
-	// Mesh shading and the classic vertex pipeline are mutually exclusive
-	// per draw, so TASK_EXT/MESH_EXT and VERTEX/TESSELLATION_*/GEOMETRY must
-	// each be explicitly bound (real object or null) every time the command
-	// buffer switches between the two.
-	//
 	task_shader := get_shader(ctx, "suzanne", {.TASK_EXT})
 	mesh_shader := get_shader(ctx, "suzanne", {.MESH_EXT})
 	mesh_fragment_shader := get_shader(ctx, "suzanne", {.FRAGMENT})

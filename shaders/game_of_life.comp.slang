@@ -5,7 +5,7 @@ struct PC
 {
     Ptr<uint> prev;
     Ptr<uint> curr;
-    Ptr<UBO> ubo;
+    Ptr<UBO, Access.Read> ubo;
 
     uint width;
     uint height;

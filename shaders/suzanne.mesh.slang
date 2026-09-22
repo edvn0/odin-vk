@@ -8,9 +8,9 @@ struct Bounds
 
 struct PC
 {
-    Ptr<Vertex> vertices;
-    Ptr<Bounds> bounds; // unused here, read by the task shader
-    Ptr<UBO> ubo; // unused here, available for future per-frame effects
+    Ptr<Vertex, Access.Read> vertices;
+    Ptr<Bounds, Access.Read> bounds; // unused here, read by the task shader
+    Ptr<UBO, Access.Read> ubo; // unused here, available for future per-frame effects
     float angle;
     float aspect;
     uint count;
@@ -102,15 +102,17 @@ void main(
 
     for (uint i = 0; i < 3; ++i)
     {
-        Vertex v = pc.vertices[global_base + local_base + i];
-        float3 pos = decode_position(v);
+        var v = pc.vertices[global_base + local_base + i];
+        DecodedVertex dv;
+        decode_vertex(v, dv);
+        float3 pos = dv.position;
         float3 world_pos = rotate_y(pos, pc.angle);
-        float3 world_normal = rotate_y(decode_normal(v), pc.angle);
+        float3 world_normal = rotate_y(dv.normal, pc.angle);
 
         MeshOutput o;
         o.position = project(world_pos - EYE, pc.aspect);
         o.normal = world_normal;
-        o.uv = decode_uv(v);
+        o.uv = dv.uv;
 
         verts[local_base + i] = o;
     }

@@ -1,4 +1,6 @@
-struct Vertex
+module mesh;
+
+public struct Vertex
 {
     uint position_xy; // f16 x | f16 y << 16
     uint position_z;  // f16 z, high 16 bits reserved
@@ -6,6 +8,22 @@ struct Vertex
     uint normal;      // octahedral snorm16 x | snorm16 y << 16
     uint tangent;     // octahedral unorm15 x | unorm15 y << 15 | sign << 31
 };
+
+public struct DecodedVertex
+{
+    public float3 position;
+    public float2 uv;
+    public float3 normal;
+    public float4 tangent;
+};
+
+public void decode_vertex(Vertex v, out DecodedVertex dv)
+{
+    dv.position = decode_position(v);
+    dv.uv = decode_uv(v);
+    dv.normal = decode_normal(v);
+    dv.tangent = decode_tangent(v);
+}
 
 float3 decode_position(Vertex v)
 {

@@ -10,38 +10,22 @@ import "core:strings"
 import "core:text/table"
 
 import "config"
-import "render"
 import ds "data_structures"
+import "render"
 import "vendor:sdl2"
 import vk "vendor:vulkan"
 
 print_backtrace :: proc() {
-	trace_ctx: trace.Context
-	if !trace.init(&trace_ctx) {
-		fmt.eprintln("failed to init call trace")
+	capture := trace.capture(1)
+
+	locations, err := trace.resolve(capture)
+	if err != nil {
+		fmt.eprintfln("failed to resolve call trace: %v", err)
 		return
 	}
-	defer trace.destroy(&trace_ctx)
+	defer trace.locations_destroy(locations)
 
-	buf: [32]trace.Frame
-	frames := trace.frames(&trace_ctx, 1, buf[:])
-
-	for f in frames {
-		fl := trace.resolve(&trace_ctx, f, context.allocator)
-		defer trace.delete_frame_location(fl)
-
-		if fl.file_path == "" {
-			continue
-		}
-
-		fmt.eprintfln(
-			"%s(%d:%d) - %s",
-			fl.file_path,
-			fl.line,
-			fl.column,
-			fl.procedure,
-		)
-	}
+	trace.print(locations)
 }
 
 debug_callback :: proc "system" (
@@ -107,9 +91,11 @@ init_vulkan :: proc(ctx: ^render.Context) {
 	ext_count: u32
 	sdl2.Vulkan_GetInstanceExtensions(ctx.window, &ext_count, nil)
 	sdl_extensions := make([]cstring, ext_count)
+	defer delete(sdl_extensions)
 	sdl2.Vulkan_GetInstanceExtensions(ctx.window, &ext_count, raw_data(sdl_extensions))
 
 	all_extensions := make([]cstring, ext_count + 1)
+	defer delete(all_extensions)
 	copy(all_extensions, sdl_extensions)
 	all_extensions[ext_count] = "VK_EXT_debug_utils"
 
@@ -145,9 +131,14 @@ init_vulkan :: proc(ctx: ^render.Context) {
 
 	vk.GetPhysicalDeviceProperties(ctx.physical_device, &ctx.physical_device_properties)
 	push_constant_supported_size := min(
-		128,
+		256,
 		ctx.physical_device_properties.limits.maxPushConstantsSize,
 	)
+
+	if ctx.physical_device_properties.limits.maxPushConstantsSize < 256 {
+		fmt.printfln("Push constants size not supported: %d", ctx.physical_device_properties.limits.maxPushConstantsSize)
+		fmt.panicf("Push constants size not supported: %d", ctx.physical_device_properties.limits.maxPushConstantsSize)
+	}
 
 	fmt.printfln(
 		"Push constants size supported: %d, use %d",
@@ -208,19 +199,23 @@ init_vulkan :: proc(ctx: ^render.Context) {
 		has_task_shader := names_with_task_shader[name]
 
 		loaded := load_spirv_file(ctx, file_name, has_task_shader)
-
+		owned_name := strings.clone(loaded.name, context.allocator)
 		key := render.Shader_Key {
-			name  = loaded.name,
+			name  = owned_name,
 			stage = loaded.stage,
 		}
 
 		if key in ctx.shaders {
-			fmt.panicf("duplicate shader '%s' stage %v", loaded.name, loaded.stage)
+			fmt.panicf("duplicate shader '%s' stage %v", owned_name, loaded.stage)
 		}
 
 		ctx.shaders[key] = loaded.handle
 
-		table.row(&shader_table, loaded.name, table.format(&shader_table, "%v", vk.ShaderStageFlags(loaded.stage)))
+		table.row(
+			&shader_table,
+			owned_name,
+			table.format(&shader_table, "%v", vk.ShaderStageFlags(loaded.stage)),
+		)
 	}
 
 	writer := strings.to_writer(&log_buffer)
@@ -240,40 +235,61 @@ REQUIRED_DEVICE_EXTENSIONS :: []cstring {
 	"VK_EXT_shader_object",
 	"VK_KHR_present_id",
 	"VK_KHR_present_wait",
-	// VK_EXT_shader_object replaces VkPipeline, so all fixed-function
-	// graphics state that a pipeline would otherwise bake in must be set
-	// dynamically. Vulkan 1.3 core covers most of it (cull mode, front
-	// face, topology, depth/stencil test enables, ...); these two
-	// extensions cover what 1.3 core does not: vertex input state and
-	// rasterization/blend state.
 	"VK_EXT_extended_dynamic_state3",
 	"VK_EXT_vertex_input_dynamic_state",
-	// Suzanne is drawn by a mesh shader (shaders/suzanne.mesh.slang)
-	// reading a flat vertex buffer by device address, rather than a
-	// classic vertex-input-assembly pipeline.
 	"VK_EXT_mesh_shader",
-	// Needed to select VK_PRESENT_MODE_FIFO_LATEST_READY_KHR below.
-	"VK_KHR_present_mode_fifo_latest_ready",
 }
 
-device_supports_extensions :: proc(device: vk.PhysicalDevice, required: []cstring) -> bool {
+FIFO_LATEST_READY_EXTENSION :: "VK_KHR_present_mode_fifo_latest_ready"
+
+
+device_supports_extension :: proc(device: vk.PhysicalDevice, name: cstring) -> bool {
 	count: u32
 	vk.EnumerateDeviceExtensionProperties(device, nil, &count, nil)
+
 	available := make([]vk.ExtensionProperties, count)
 	defer delete(available)
+
 	vk.EnumerateDeviceExtensionProperties(device, nil, &count, raw_data(available))
 
-	for name in required {
-		found := false
-		for &ext in available {
-			if cstring(raw_data(ext.extensionName[:])) == name {
-				found = true
-				break
-			}
+	for &ext in available {
+		if cstring(raw_data(ext.extensionName[:])) == name {
+			return true
 		}
-		if !found do return false
 	}
+
+	return false
+}
+
+
+device_supports_extensions :: proc(device: vk.PhysicalDevice, required: []cstring) -> bool {
+	for name in required {
+		if !device_supports_extension(device, name) {
+			return false
+		}
+	}
+
 	return true
+}
+
+
+device_supports_fifo_latest_ready :: proc(device: vk.PhysicalDevice) -> bool {
+	if !device_supports_extension(device, FIFO_LATEST_READY_EXTENSION) {
+		return false
+	}
+
+	fifo_features := vk.PhysicalDevicePresentModeFifoLatestReadyFeaturesKHR {
+		sType = .PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR,
+	}
+
+	features := vk.PhysicalDeviceFeatures2 {
+		sType = .PHYSICAL_DEVICE_FEATURES_2,
+		pNext = &fifo_features,
+	}
+
+	vk.GetPhysicalDeviceFeatures2(device, &features)
+
+	return fifo_features.presentModeFifoLatestReady == true
 }
 
 pick_physical_device :: proc(ctx: ^render.Context) {
@@ -288,6 +304,7 @@ pick_physical_device :: proc(ctx: ^render.Context) {
 		family_count: u32
 		vk.GetPhysicalDeviceQueueFamilyProperties(device, &family_count, nil)
 		families := make([]vk.QueueFamilyProperties, family_count)
+		defer delete(families)
 		vk.GetPhysicalDeviceQueueFamilyProperties(device, &family_count, raw_data(families))
 
 		for family, i in families {
@@ -300,17 +317,21 @@ pick_physical_device :: proc(ctx: ^render.Context) {
 			ctx.physical_device = device
 			ctx.compute_family = u32(i)
 
-			device_info:= vk.PhysicalDeviceProperties{}
+			device_info := vk.PhysicalDeviceProperties{}
 			vk.GetPhysicalDeviceProperties(device, &device_info)
 
-			name:= cstring(raw_data(device_info.deviceName[:]))
+			name := cstring(raw_data(device_info.deviceName[:]))
 
-			fmt.printfln("Selected physical device %v with compute+present queue family %d", name, i)
-
-
+			fmt.printfln(
+				"Selected physical device %v with compute+present queue family %d",
+				name,
+				i,
+			)
+			delete(devices)
 			return
 		}
 	}
+	delete(devices)
 	fmt.panicf("no compute+present capable gpu found with required extension support")
 }
 
@@ -323,9 +344,15 @@ create_logical_device :: proc(ctx: ^render.Context) {
 		pQueuePriorities = &priority,
 	}
 
-	// The fullscreen-triangle vertex shader's SV_VertexID lowers to
-	// gl_VertexIndex, which Slang implements relative to gl_BaseVertex and
-	// so requires the SPIR-V DrawParameters capability.
+	features := vk.PhysicalDeviceFeatures {
+		shaderInt16               = true,
+		geometryShader            = true,
+		tessellationShader        = true,
+		multiDrawIndirect         = true,
+		drawIndirectFirstInstance = true,
+	}
+
+
 	features_11 := vk.PhysicalDeviceVulkan11Features {
 		sType                = .PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
 		shaderDrawParameters = true,
@@ -342,10 +369,9 @@ create_logical_device :: proc(ctx: ^render.Context) {
 		descriptorBindingPartiallyBound              = true,
 		descriptorBindingSampledImageUpdateAfterBind = true,
 		descriptorBindingStorageImageUpdateAfterBind = true,
+		shaderFloat16                                = true,
 	}
 
-	// VK_EXT_shader_object requires dynamicRendering to be enabled, even
-	// though this app never records a render pass.
 	features_13 := vk.PhysicalDeviceVulkan13Features {
 		pNext            = &features_12,
 		sType            = .PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
@@ -366,7 +392,6 @@ create_logical_device :: proc(ctx: ^render.Context) {
 		shaderObject = true,
 	}
 
-	// VK_KHR_present_wait requires VK_KHR_present_id to also be enabled.
 	features_present_id := vk.PhysicalDevicePresentIdFeaturesKHR {
 		sType     = .PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
 		pNext     = &features_shader_object,
@@ -379,50 +404,78 @@ create_logical_device :: proc(ctx: ^render.Context) {
 		presentWait = true,
 	}
 
-	// Needed to draw with shader objects: no VkPipeline means no baked
-	// vertex input state, so it must be supplied via vkCmdSetVertexInputEXT.
 	features_vertex_input := vk.PhysicalDeviceVertexInputDynamicStateFeaturesEXT {
 		sType                   = .PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT,
 		pNext                   = &features_present_wait,
 		vertexInputDynamicState = true,
 	}
 
-	// Needed to draw with shader objects: rasterization/blend state that a
-	// VkPipeline would otherwise fix at creation time.
 	features_eds3 := vk.PhysicalDeviceExtendedDynamicState3FeaturesEXT {
-		sType = .PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT,
-		pNext = &features_vertex_input,
-		extendedDynamicState3PolygonMode          = true,
-		extendedDynamicState3RasterizationSamples = true,
-		extendedDynamicState3SampleMask           = true,
+		sType                                      = .PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT,
+		pNext                                      = &features_vertex_input,
+		extendedDynamicState3PolygonMode           = true,
+		extendedDynamicState3RasterizationSamples  = true,
+		extendedDynamicState3SampleMask            = true,
 		extendedDynamicState3AlphaToCoverageEnable = true,
-		extendedDynamicState3ColorBlendEnable     = true,
-		extendedDynamicState3ColorBlendEquation   = true,
-		extendedDynamicState3ColorWriteMask       = true,
+		extendedDynamicState3ColorBlendEnable      = true,
+		extendedDynamicState3ColorBlendEquation    = true,
+		extendedDynamicState3ColorWriteMask        = true,
 	}
 
-	// Needed to select VK_PRESENT_MODE_FIFO_LATEST_READY_KHR in create_swapchain.
-	features_present_mode_fifo_latest_ready := vk.PhysicalDevicePresentModeFifoLatestReadyFeaturesKHR {
+	has_fifo_latest_ready := device_supports_fifo_latest_ready(ctx.physical_device)
+
+	features_fifo_latest_ready := vk.PhysicalDevicePresentModeFifoLatestReadyFeaturesKHR {
 		sType                      = .PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR,
 		pNext                      = &features_eds3,
 		presentModeFifoLatestReady = true,
 	}
 
-	device_extensions := REQUIRED_DEVICE_EXTENSIONS
+	// Add the optional extension only when both the extension and its
+	// corresponding feature are actually supported.
+	optional_extension_count := 0
+	if has_fifo_latest_ready {
+		optional_extension_count = 1
+	}
+
+	device_extensions := make(
+		[]cstring,
+		len(REQUIRED_DEVICE_EXTENSIONS) + optional_extension_count,
+	)
+	defer delete(device_extensions)
+
+	copy(device_extensions, REQUIRED_DEVICE_EXTENSIONS)
+
+	if has_fifo_latest_ready {
+		device_extensions[len(REQUIRED_DEVICE_EXTENSIONS)] = FIFO_LATEST_READY_EXTENSION
+	}
+
+	device_pnext: rawptr = &features_eds3
+
+	if has_fifo_latest_ready {
+		device_pnext = &features_fifo_latest_ready
+	}
+
 	device_info := vk.DeviceCreateInfo {
 		sType                   = .DEVICE_CREATE_INFO,
-		pNext                   = &features_present_mode_fifo_latest_ready,
+		pNext                   = device_pnext,
 		queueCreateInfoCount    = 1,
 		pQueueCreateInfos       = &queue_info,
 		enabledExtensionCount   = u32(len(device_extensions)),
 		ppEnabledExtensionNames = raw_data(device_extensions),
+		pEnabledFeatures        = &features,
 	}
-
 
 	if res := vk.CreateDevice(ctx.physical_device, &device_info, nil, &ctx.device);
 	   res != .SUCCESS {
 		fmt.panicf("failed to create device: %v", res)
 	}
+
+	if has_fifo_latest_ready {
+		fmt.println("FIFO latest-ready presentation supported")
+	} else {
+		fmt.println("FIFO latest-ready presentation unavailable; using fallback")
+	}
+
 	vk.GetDeviceQueue(ctx.device, ctx.compute_family, 0, &ctx.compute_queue)
 }
 
@@ -476,23 +529,53 @@ create_swapchain :: proc(ctx: ^render.Context, old_swapchain: vk.SwapchainKHR = 
 
 	find_supported_present_mode := proc(ctx: ^render.Context) -> vk.PresentModeKHR {
 		present_mode_count: u32
-		vk.GetPhysicalDeviceSurfacePresentModesKHR(ctx.physical_device, ctx.surface, &present_mode_count, nil)
+
+		vk.GetPhysicalDeviceSurfacePresentModesKHR(
+			ctx.physical_device,
+			ctx.surface,
+			&present_mode_count,
+			nil,
+		)
+
 		present_modes := make([]vk.PresentModeKHR, present_mode_count)
 		defer delete(present_modes)
-		vk.GetPhysicalDeviceSurfacePresentModesKHR(ctx.physical_device, ctx.surface, &present_mode_count, raw_data(present_modes))
 
-		selected_mode := vk.PresentModeKHR .FIFO
+		vk.GetPhysicalDeviceSurfacePresentModesKHR(
+			ctx.physical_device,
+			ctx.surface,
+			&present_mode_count,
+			raw_data(present_modes),
+		)
+
+		has_fifo_latest_ready := device_supports_fifo_latest_ready(ctx.physical_device)
+
+		has_mailbox := false
+		has_latest_ready := false
+
 		for mode in present_modes {
-			if mode == .MAILBOX {
-				selected_mode = .MAILBOX
-			}
+			#partial switch mode {
+			case .MAILBOX:
+				has_mailbox = true
 
-			if mode == .FIFO_LATEST_READY {
-				selected_mode = .FIFO_LATEST_READY
+			case .FIFO_LATEST_READY:
+				has_latest_ready = true
+
+			case:
 			}
 		}
 
+		selected_mode := vk.PresentModeKHR.FIFO
+
+		if has_mailbox {
+			selected_mode = .MAILBOX
+		}
+
+		if has_fifo_latest_ready && has_latest_ready {
+			selected_mode = .FIFO_LATEST_READY
+		}
+
 		fmt.printfln("Selected present mode: %v", selected_mode)
+
 		return selected_mode
 	}
 
@@ -617,58 +700,56 @@ create_descriptor_set_layout :: proc(ctx: ^render.Context) {
 
 	bindings := []vk.DescriptorSetLayoutBinding {
 		{
-			binding         = 0,
-			descriptorType  = .SAMPLER,
+			binding = 0,
+			descriptorType = .SAMPLER,
 			descriptorCount = render.MAX_BINDLESS_ARRAY_SIZE,
-			stageFlags      = vk.ShaderStageFlags_ALL,
+			stageFlags = vk.ShaderStageFlags_ALL,
 		},
 		{
-			binding         = 1,
-			descriptorType  = .SAMPLED_IMAGE,
+			binding = 1,
+			descriptorType = .SAMPLED_IMAGE,
 			descriptorCount = render.MAX_BINDLESS_ARRAY_SIZE,
-			stageFlags      = vk.ShaderStageFlags_ALL,
+			stageFlags = vk.ShaderStageFlags_ALL,
 		},
 		{
-			binding         = 2,
-			descriptorType  = .STORAGE_IMAGE,
+			binding = 2,
+			descriptorType = .STORAGE_IMAGE,
 			descriptorCount = render.MAX_BINDLESS_ARRAY_SIZE,
-			stageFlags      = vk.ShaderStageFlags_ALL,
+			stageFlags = vk.ShaderStageFlags_ALL,
 		},
 		{
-			binding         = 3,
-			descriptorType  = .SAMPLED_IMAGE,
+			binding = 3,
+			descriptorType = .SAMPLED_IMAGE,
 			descriptorCount = render.MAX_BINDLESS_ARRAY_SIZE,
-			stageFlags      = vk.ShaderStageFlags_ALL,
+			stageFlags = vk.ShaderStageFlags_ALL,
 		},
 		{
-			binding         = 4,
-			descriptorType  = .STORAGE_IMAGE,
+			binding = 4,
+			descriptorType = .STORAGE_IMAGE,
 			descriptorCount = render.MAX_BINDLESS_ARRAY_SIZE,
-			stageFlags      = vk.ShaderStageFlags_ALL,
+			stageFlags = vk.ShaderStageFlags_ALL,
 		},
 		{
-			binding         = 5,
-			descriptorType  = .SAMPLER,
+			binding = 5,
+			descriptorType = .SAMPLER,
 			descriptorCount = render.MAX_BINDLESS_ARRAY_SIZE,
-			stageFlags      = vk.ShaderStageFlags_ALL,
+			stageFlags = vk.ShaderStageFlags_ALL,
 		},
 		{
-			binding         = 6,
-			descriptorType  = .SAMPLER,
+			binding = 6,
+			descriptorType = .SAMPLER,
 			descriptorCount = render.MAX_BINDLESS_ARRAY_SIZE,
-			stageFlags      = vk.ShaderStageFlags_ALL,
+			stageFlags = vk.ShaderStageFlags_ALL,
 		},
 		{
-			binding         = 7,
-			descriptorType  = .SAMPLED_IMAGE,
+			binding = 7,
+			descriptorType = .SAMPLED_IMAGE,
 			descriptorCount = render.MAX_BINDLESS_ARRAY_SIZE,
-			stageFlags      = vk.ShaderStageFlags_ALL,
+			stageFlags = vk.ShaderStageFlags_ALL,
 		},
 	}
 
-	bindless_binding_flags := vk.DescriptorBindingFlags {
-		(.PARTIALLY_BOUND | .UPDATE_AFTER_BIND),
-	}
+	bindless_binding_flags := vk.DescriptorBindingFlags{(.PARTIALLY_BOUND | .UPDATE_AFTER_BIND)}
 
 	binding_flags := []vk.DescriptorBindingFlags {
 		bindless_binding_flags,
@@ -735,7 +816,11 @@ create_command_pool :: proc(ctx: ^render.Context) {
 	}
 }
 
-create_buffer :: proc(ctx: ^render.Context, size: vk.DeviceSize, usage: vk.BufferUsageFlags = {.STORAGE_BUFFER, .SHADER_DEVICE_ADDRESS}) -> render.Buffer_Handle {
+create_buffer :: proc(
+	ctx: ^render.Context,
+	size: vk.DeviceSize,
+	usage: vk.BufferUsageFlags = {.STORAGE_BUFFER, .SHADER_DEVICE_ADDRESS},
+) -> render.Buffer_Handle {
 	buffer: render.Buffer
 
 	usage_with_device_address := usage | {.SHADER_DEVICE_ADDRESS}
@@ -890,10 +975,10 @@ create_image :: proc(
 	}
 
 	view_info := vk.ImageViewCreateInfo {
-		sType    = .IMAGE_VIEW_CREATE_INFO,
-		image    = image.object,
+		sType = .IMAGE_VIEW_CREATE_INFO,
+		image = image.object,
 		viewType = .D2,
-		format   = format,
+		format = format,
 		subresourceRange = {aspectMask = aspect, levelCount = 1, layerCount = 1},
 	}
 
@@ -933,16 +1018,16 @@ transition_image_to_general :: proc(ctx: ^render.Context, image: vk.Image) {
 	}
 
 	barrier := vk.ImageMemoryBarrier2 {
-		sType               = .IMAGE_MEMORY_BARRIER_2,
-		srcStageMask        = {.TOP_OF_PIPE},
-		dstStageMask        = {.COMPUTE_SHADER},
-		dstAccessMask       = {.SHADER_WRITE},
-		oldLayout           = .UNDEFINED,
-		newLayout           = .GENERAL,
+		sType = .IMAGE_MEMORY_BARRIER_2,
+		srcStageMask = {.TOP_OF_PIPE},
+		dstStageMask = {.COMPUTE_SHADER},
+		dstAccessMask = {.SHADER_WRITE},
+		oldLayout = .UNDEFINED,
+		newLayout = .GENERAL,
 		srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
 		dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
-		image               = image,
-		subresourceRange    = {aspectMask = {.COLOR}, levelCount = 1, layerCount = 1},
+		image = image,
+		subresourceRange = {aspectMask = {.COLOR}, levelCount = 1, layerCount = 1},
 	}
 
 	dependency_info := vk.DependencyInfo {
@@ -994,7 +1079,10 @@ init_simulation :: proc(ctx: ^render.Context) {
 
 	// Seed generation zero with a random population in buffers[current],
 	// which run_frame will read as "prev" for the first dispatch.
-	seed_buffer, found := render.resource_try_get(&ctx.buffer_pool, ctx.simulation.buffers[ctx.simulation.current])
+	seed_buffer, found := render.resource_try_get(
+		&ctx.buffer_pool,
+		ctx.simulation.buffers[ctx.simulation.current],
+	)
 	if !found {
 		fmt.panicf("failed to get simulation seed buffer")
 	}
@@ -1011,14 +1099,20 @@ init_simulation :: proc(ctx: ^render.Context) {
 		{.STORAGE, .SAMPLED},
 	)
 
-	display_image, image_found := render.resource_try_get(&ctx.image_pool, ctx.simulation.display_image)
+	display_image, image_found := render.resource_try_get(
+		&ctx.image_pool,
+		ctx.simulation.display_image,
+	)
 	if !image_found {
 		fmt.panicf("failed to get freshly created display image")
 	}
 
 	transition_image_to_general(ctx, display_image.object)
 
-	storage_handle, storage_ok := render.bindless_allocate_storage_image_2d(ctx, display_image.view)
+	storage_handle, storage_ok := render.bindless_allocate_storage_image_2d(
+		ctx,
+		display_image.view,
+	)
 	if !storage_ok {
 		fmt.panicf("failed to allocate bindless storage slot for display image")
 	}
@@ -1044,12 +1138,18 @@ init_render_targets :: proc(ctx: ^render.Context) {
 		create_offscreen_image(ctx, slot)
 		create_depth_image(ctx, slot)
 
-		offscreen_image, found := render.resource_try_get(&ctx.image_pool, ctx.offscreen_images[slot])
+		offscreen_image, found := render.resource_try_get(
+			&ctx.image_pool,
+			ctx.offscreen_images[slot],
+		)
 		if !found {
 			fmt.panicf("failed to get freshly created offscreen image for slot %d", slot)
 		}
 
-		texture_handle, texture_ok := render.bindless_allocate_texture_2d(ctx, offscreen_image.view)
+		texture_handle, texture_ok := render.bindless_allocate_texture_2d(
+			ctx,
+			offscreen_image.view,
+		)
 		if !texture_ok {
 			fmt.panicf("failed to allocate bindless texture slot for offscreen image %d", slot)
 		}
@@ -1057,17 +1157,18 @@ init_render_targets :: proc(ctx: ^render.Context) {
 	}
 
 	sampler_info := vk.SamplerCreateInfo {
-		sType         = .SAMPLER_CREATE_INFO,
-		magFilter     = .NEAREST,
-		minFilter     = .NEAREST,
-		mipmapMode    = .NEAREST,
-		addressModeU  = .CLAMP_TO_EDGE,
-		addressModeV  = .CLAMP_TO_EDGE,
-		addressModeW  = .CLAMP_TO_EDGE,
-		maxLod        = 0,
+		sType        = .SAMPLER_CREATE_INFO,
+		magFilter    = .NEAREST,
+		minFilter    = .NEAREST,
+		mipmapMode   = .NEAREST,
+		addressModeU = .CLAMP_TO_EDGE,
+		addressModeV = .CLAMP_TO_EDGE,
+		addressModeW = .CLAMP_TO_EDGE,
+		maxLod       = 0,
 	}
 
-	if res := vk.CreateSampler(ctx.device, &sampler_info, nil, &ctx.nearest_sampler); res != .SUCCESS {
+	if res := vk.CreateSampler(ctx.device, &sampler_info, nil, &ctx.nearest_sampler);
+	   res != .SUCCESS {
 		fmt.panicf("failed to create nearest sampler: %v", res)
 	}
 
@@ -1113,12 +1214,19 @@ recreate_offscreen_target :: proc(ctx: ^render.Context) {
 		create_offscreen_image(ctx, slot)
 		create_depth_image(ctx, slot)
 
-		offscreen_image, found := render.resource_try_get(&ctx.image_pool, ctx.offscreen_images[slot])
+		offscreen_image, found := render.resource_try_get(
+			&ctx.image_pool,
+			ctx.offscreen_images[slot],
+		)
 		if !found {
 			fmt.panicf("failed to get recreated offscreen image for slot %d", slot)
 		}
 
-		render.bindless_update_texture_2d(ctx, ctx.offscreen_texture_indices[slot], offscreen_image.view)
+		render.bindless_update_texture_2d(
+			ctx,
+			ctx.offscreen_texture_indices[slot],
+			offscreen_image.view,
+		)
 	}
 }
 
@@ -1229,6 +1337,11 @@ cleanup :: proc(ctx: ^render.Context) {
 	for frame in 0 ..< 3 {
 		vk.DestroySemaphore(ctx.device, ctx.frames[frame].image_available, nil)
 	}
+
+	for key in ctx.shaders {
+		delete(key.name)
+	}
+	delete(ctx.shaders)
 
 	vk.DestroySampler(ctx.device, ctx.nearest_sampler, nil)
 

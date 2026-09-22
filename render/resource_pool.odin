@@ -19,35 +19,6 @@ Shader_Handle :: struct {
 	gen: u16,
 }
 
-print_backtrace :: proc() {
-	trace_ctx: trace.Context
-	if !trace.init(&trace_ctx) {
-		fmt.eprintln("failed to init call trace")
-		return
-	}
-	defer trace.destroy(&trace_ctx)
-
-	buf: [32]trace.Frame
-	frames := trace.frames(&trace_ctx, 1, buf[:])
-
-	for f in frames {
-		fl := trace.resolve(&trace_ctx, f, context.allocator)
-		defer trace.delete_frame_location(fl)
-
-		if fl.file_path == "" {
-			continue
-		}
-
-		fmt.eprintfln(
-			"%s(%d:%d) - %s",
-			fl.file_path,
-			fl.line,
-			fl.column,
-			fl.procedure,
-		)
-	}
-}
-
 Buffer_Handle :: struct {
 	idx: u16,
 	gen: u16,
@@ -156,7 +127,6 @@ get_shader :: proc(
 
 	handle, found := ctx.shaders[key]
 	if !found {
-		print_backtrace()
 		fmt.panicf(
 			"shader '%s' stage %v not found",
 			name,

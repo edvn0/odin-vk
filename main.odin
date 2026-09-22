@@ -3,6 +3,7 @@ package main
 import "core:fmt"
 import "vendor:sdl2"
 import "render"
+import "core:debug/trace"
 import vk_io "vk_io"
 
 write_grid_snapshot :: proc(
@@ -27,6 +28,19 @@ write_grid_snapshot :: proc(
 }
 
 main :: proc() {
+	track: trace.Tracking_Allocator
+	trace.tracking_allocator_init(&track, context.allocator)
+	defer trace.tracking_allocator_destroy(&track)
+
+	context.allocator = trace.tracking_allocator(&track)
+	defer trace.tracking_allocator_print_results(&track)
+
+	context.assertion_failure_proc = trace.assertion_failure_proc
+
+	_main()
+}
+
+_main :: proc() {
 	ctx: render.Context
 	init_window(&ctx)
 	init_vulkan(&ctx)

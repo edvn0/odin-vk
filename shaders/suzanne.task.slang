@@ -8,9 +8,9 @@ struct Bounds
 
 struct PC
 {
-    Ptr<Vertex> vertices; // unused here, read by the mesh shader
-    Ptr<Bounds> bounds;
-    Ptr<UBO> ubo; // unused here, part of the shared PC layout (see suzanne.mesh.slang)
+    Ptr<Vertex, Access.Read> vertices; // unused here, read by the mesh shader
+    Ptr<Bounds, Access.Read> bounds;
+    Ptr<UBO, Access.Read> ubo; // unused here, part of the shared PC layout (see suzanne.mesh.slang)
     float angle;
     float aspect;
     uint count; // unused here, read by the mesh shader
