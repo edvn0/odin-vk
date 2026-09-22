@@ -32,17 +32,6 @@ Screenshot_View :: struct {
 	frame_number: u64,
 }
 
-//
-// Queues a screenshot request. The request stays Queued until it is actually
-// attached to a successfully submitted frame in run_frame -- calling this
-// does not by itself consume the next run_frame call, e.g. if swapchain
-// acquisition times out or is out-of-date immediately afterward.
-//
-// A free (previously released) slot is reused when available, otherwise the
-// backing array grows. The renderer supports any number of outstanding
-// requests; restricting to one at a time (e.g. for interactive Ctrl+P) is an
-// application-layer concern.
-//
 screenshot_request :: proc(
 	ctx: ^Context,
 	desc := Screenshot_Desc{target = .Offscreen},
@@ -141,12 +130,6 @@ screenshot_status :: proc(ctx: ^Context, handle: Screenshot_Handle) -> Screensho
 	return req.state
 }
 
-//
-// Only valid once screenshot_status reports Ready. The returned pixels alias
-// the readback buffer's mapped memory directly -- callers that need to keep
-// the data (e.g. handing it to async I/O) must copy it out before calling
-// screenshot_release, which may recycle or destroy the backing buffer.
-//
 screenshot_map :: proc(ctx: ^Context, handle: Screenshot_Handle) -> (Screenshot_View, bool) {
 	req, found := screenshot_try_get(ctx, handle)
 	if !found || req.state != .Ready {

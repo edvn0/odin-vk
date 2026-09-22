@@ -1266,6 +1266,9 @@ cleanup :: proc(ctx: ^render.Context) {
 	ctx.draw_stream.draw_data = nil
 	ctx.draw_stream.submissions = nil
 
+	delete(ctx.screenshots.requests)
+	ctx.screenshots.requests = nil
+
 	destroy_render_finished_semaphores(ctx)
 	vk.DestroySemaphore(ctx.device, ctx.timeline_semaphore, nil)
 

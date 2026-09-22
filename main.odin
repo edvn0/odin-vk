@@ -94,11 +94,6 @@ BMP_Info_Header :: struct #packed {
 	colors_important: u32le,
 }
 
-// Uncompressed 24bpp BMP, bottom-up rows padded to 4 bytes, alpha dropped.
-// Only needs to handle the two 8-bit-per-channel families the renderer's
-// offscreen target can actually be (see screenshot_format_bytes_per_pixel);
-// anything else means the renderer added a new format this hasn't caught up
-// with yet.
 encode_bmp :: proc(view: render.Screenshot_View, allocator := context.allocator) -> []u8 {
 	width := int(view.width)
 	height := int(view.height)
